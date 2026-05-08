@@ -17,8 +17,8 @@ import json
 import time
 import logging
 import requests
-import psycopg2
-import psycopg2.extras
+import pg8000
+import pg8000.dbapi
 from datetime import datetime, timezone
 from typing import Optional
 from shapely.geometry import shape, LineString, Polygon, Point, mapping
@@ -36,13 +36,32 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def get_db():
-    return psycopg2.connect(
+    return pg8000.dbapi.connect(
         host=os.getenv("DB_HOST", "localhost"),
-        port=os.getenv("DB_PORT", 5432),
-        dbname=os.getenv("DB_NAME", "lawnroute"),
+        port=int(os.getenv("DB_PORT", 5432)),
+        database=os.getenv("DB_NAME", "lawnroute"),
         user=os.getenv("DB_USER", "lawnroute"),
         password=os.getenv("DB_PASSWORD", "lawnroute_dev_2025"),
+        ssl_context=True,
     )
+
+def dict_row(conn, row, description):
+    """Convert a row tuple to a dict using column descriptions."""
+    if row is None:
+        return None
+    return {description[i][0]: row[i] for i in range(len(description))}
+
+def fetchone_dict(cur):
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return {cur.description[i][0]: row[i] for i in range(len(cur.description))}
+
+def fetchall_dict(cur):
+    rows = cur.fetchall()
+    if not rows:
+        return []
+    return [{cur.description[i][0]: row[i] for i in range(len(cur.description))} for row in rows]
 
 # ---------------------------------------------------------------------------
 # Overpass API
@@ -205,34 +224,24 @@ def classify_way(tags: dict, coords: list, boundary: Polygon) -> list:
     width_tag  = tags.get("width", None)
     closed     = len(coords) > 2 and coords[0] == coords[-1]
 
-    # -----------------------------------------------------------------------
-    # HARD EXCLUSIONS
-    # -----------------------------------------------------------------------
-
     if waterway in ("river", "stream", "canal", "drain", "ditch"):
-        return [_edge("none", "water_feature", coords, tags, "Water — excluded")]
+        return [_edge("none", "water_feature", coords, tags, "Water - excluded")]
 
     if amenity == "swimming_pool" or leisure == "swimming_pool":
-        return [_edge("none", "swimming_pool", coords, tags, "Pool — excluded")]
+        return [_edge("none", "swimming_pool", coords, tags, "Pool - excluded")]
 
     if surface == "sand" or golf == "bunker" or natural == "sand":
-        return [_edge("none", "sand_bunker", coords, tags, "Sand/bunker — excluded")]
+        return [_edge("none", "sand_bunker", coords, tags, "Sand/bunker - excluded")]
 
     if golf in ("green", "tee", "hole"):
-        return [_edge("none", "golf_feature", coords, tags, f"Golf {golf} — excluded")]
-
-    # -----------------------------------------------------------------------
-    # MAJOR ROADS — excluded, but driveways/service = blow
-    # -----------------------------------------------------------------------
+        return [_edge("none", "golf_feature", coords, tags, f"Golf {golf} - excluded")]
 
     if highway in ("motorway", "trunk", "primary", "secondary", "tertiary",
                    "residential", "unclassified", "living_street"):
         if closed:
-            return [_edge("blow", "road_surface", coords, tags,
-                          "Road/parking polygon — blow surface")]
-        return [_edge("none", "road", coords, tags, "Public road — excluded")]
+            return [_edge("blow", "road_surface", coords, tags, "Road/parking polygon - blow surface")]
+        return [_edge("none", "road", coords, tags, "Public road - excluded")]
 
-    # Driveways and service roads = blow zone
     if highway == "service" or tags.get("service") in ("driveway", "parking_aisle", "alley"):
         line = coords_to_linestring(coords)
         if line:
@@ -242,78 +251,44 @@ def classify_way(tags: dict, coords: list, boundary: Polygon) -> list:
                 edges = []
                 for s in segs:
                     if s.length > 0:
-                        edges.append(_edge("blow", "driveway", _geom_coords(s), tags,
-                                           "Driveway/service road — blow zone"))
-                        # Also trim edge along driveway
-                        edges.append(_edge("trim", "driveway_edge", _geom_coords(s), tags,
-                                           "Driveway edge — trim", "trimmer"))
+                        edges.append(_edge("blow", "driveway", _geom_coords(s), tags, "Driveway - blow zone"))
+                        edges.append(_edge("trim", "driveway_edge", _geom_coords(s), tags, "Driveway edge - trim", "trimmer"))
                 return edges
-
-    # -----------------------------------------------------------------------
-    # PARKING LOTS = blow + trim perimeter
-    # -----------------------------------------------------------------------
 
     if amenity == "parking" or landuse == "parking":
-        edges = [_edge("blow", "parking_lot", coords, tags,
-                       "Parking lot — blower clears debris")]
+        edges = [_edge("blow", "parking_lot", coords, tags, "Parking lot - blow")]
         if closed and len(coords) >= 3:
             poly = coords_to_polygon(coords)
             if poly and boundary.intersects(poly):
                 clipped_poly = poly.intersection(boundary)
                 if hasattr(clipped_poly, 'exterior'):
                     segs = _split_geometry(clipped_poly.exterior)
-                    edges += [_edge("trim", "parking_edge", _geom_coords(s), tags,
-                                    "Parking lot edge — trim", "trimmer")
-                              for s in segs if s.length > 0]
+                    edges += [_edge("trim", "parking_edge", _geom_coords(s), tags, "Parking edge - trim", "trimmer") for s in segs if s.length > 0]
         return edges
 
-    # -----------------------------------------------------------------------
-    # PATIOS, TERRACES, PLAZAS = blow zone
-    # -----------------------------------------------------------------------
-
-    if leisure == "outdoor_seating" or \
-       amenity == "terrace" or \
-       man_made in ("terrace", "patio") or \
-       landuse == "plaza":
+    if leisure == "outdoor_seating" or amenity == "terrace" or man_made in ("terrace", "patio") or landuse == "plaza":
         if closed and len(coords) >= 3:
             poly = coords_to_polygon(coords)
             if poly and boundary.intersects(poly):
-                edges = [_edge("blow", "patio", coords, tags,
-                               "Patio/terrace — blow zone")]
+                edges = [_edge("blow", "patio", coords, tags, "Patio - blow zone")]
                 clipped_poly = poly.intersection(boundary)
                 if hasattr(clipped_poly, 'exterior'):
                     segs = _split_geometry(clipped_poly.exterior)
-                    edges += [_edge("trim", "patio_edge", _geom_coords(s), tags,
-                                    "Patio edge — trim", "trimmer")
-                              for s in segs if s.length > 0]
+                    edges += [_edge("trim", "patio_edge", _geom_coords(s), tags, "Patio edge - trim", "trimmer") for s in segs if s.length > 0]
                 return edges
 
-    # -----------------------------------------------------------------------
-    # LANDSCAPE BEDS = trim perimeter + blow adjacent
-    # -----------------------------------------------------------------------
-
-    if landuse in ("flowerbed", "plant_nursery") or \
-       natural == "flowerbed" or \
-       (leisure == "garden" and closed):
+    if landuse in ("flowerbed", "plant_nursery") or natural == "flowerbed" or (leisure == "garden" and closed):
         if closed and len(coords) >= 3:
             poly = coords_to_polygon(coords)
             if poly and boundary.intersects(poly):
                 clipped_poly = poly.intersection(boundary)
-                edges = [_edge("blow", "landscape_bed", coords, tags,
-                               "Landscape bed — blow adjacent area")]
+                edges = [_edge("blow", "landscape_bed", coords, tags, "Landscape bed - blow")]
                 if hasattr(clipped_poly, 'exterior'):
                     segs = _split_geometry(clipped_poly.exterior)
-                    edges += [_edge("trim", "landscape_bed_edge", _geom_coords(s), tags,
-                                    "Landscape bed edge — trim", "trimmer")
-                              for s in segs if s.length > 0]
+                    edges += [_edge("trim", "landscape_bed_edge", _geom_coords(s), tags, "Landscape bed edge - trim", "trimmer") for s in segs if s.length > 0]
                 return edges
 
-    # -----------------------------------------------------------------------
-    # BUILDINGS — trim perimeter
-    # -----------------------------------------------------------------------
-
-    if building or building_p or man_made in ("shed", "greenhouse", "storage_tank",
-                                               "silo", "water_tower"):
+    if building or building_p or man_made in ("shed", "greenhouse", "storage_tank", "silo", "water_tower"):
         if closed and len(coords) >= 3:
             poly = coords_to_polygon(coords)
             if poly and boundary.intersects(poly):
@@ -321,17 +296,10 @@ def classify_way(tags: dict, coords: list, boundary: Polygon) -> list:
                 clipped = perimeter.intersection(boundary)
                 if not clipped.is_empty:
                     segs = _split_geometry(clipped)
-                    return [_edge("trim", "building_perimeter", _geom_coords(s), tags,
-                                  "Building base — trim perimeter", "trimmer")
-                            for s in segs if s.length > 0]
-        return [_edge("none", "building", coords, tags, "Building — excluded")]
+                    return [_edge("trim", "building_perimeter", _geom_coords(s), tags, "Building base - trim", "trimmer") for s in segs if s.length > 0]
+        return [_edge("none", "building", coords, tags, "Building - excluded")]
 
-    # -----------------------------------------------------------------------
-    # STRUCTURES — awnings, canopies, shelters
-    # -----------------------------------------------------------------------
-
-    if building in ("roof", "canopy", "awning", "shelter", "carport") or \
-       man_made in ("canopy", "shelter"):
+    if building in ("roof", "canopy", "awning", "shelter", "carport") or man_made in ("canopy", "shelter"):
         if closed and len(coords) >= 3:
             poly = coords_to_polygon(coords)
             if poly and boundary.intersects(poly):
@@ -339,116 +307,75 @@ def classify_way(tags: dict, coords: list, boundary: Polygon) -> list:
                 clipped = perimeter.intersection(boundary)
                 if not clipped.is_empty:
                     segs = _split_geometry(clipped)
-                    return [_edge("trim", "structure_perimeter", _geom_coords(s), tags,
-                                  "Structure/awning base — trim perimeter", "trimmer")
-                            for s in segs if s.length > 0]
-        return [_edge("none", "structure", coords, tags, "Structure — excluded")]
-
-    # -----------------------------------------------------------------------
-    # FENCES AND WALLS — trim along base
-    # -----------------------------------------------------------------------
+                    return [_edge("trim", "structure_perimeter", _geom_coords(s), tags, "Structure - trim", "trimmer") for s in segs if s.length > 0]
+        return [_edge("none", "structure", coords, tags, "Structure - excluded")]
 
     if barrier in ("fence", "wall", "hedge", "retaining_wall", "guard_rail"):
         line = coords_to_linestring(coords)
         if line:
             clipped = line.intersection(boundary)
             segs = _split_geometry(clipped)
-            return [_edge("trim", "barrier_edge", _geom_coords(s), tags,
-                          f"{barrier} — trim along base", "trimmer")
-                    for s in segs if s.length > 0]
+            return [_edge("trim", "barrier_edge", _geom_coords(s), tags, f"{barrier} - trim", "trimmer") for s in segs if s.length > 0]
 
-    # -----------------------------------------------------------------------
-    # SIDEWALKS AND PATHS — blow surface + trim both edges
-    # -----------------------------------------------------------------------
-
-    if highway in ("footway", "path", "steps", "pedestrian", "cycleway",
-                   "bridleway", "track") or tags.get("footway") or \
-       tags.get("sidewalk") in ("yes", "left", "right", "both"):
+    if highway in ("footway", "path", "steps", "pedestrian", "cycleway", "bridleway", "track") or tags.get("footway") or tags.get("sidewalk") in ("yes", "left", "right", "both"):
         line = coords_to_linestring(coords)
         if not line:
             return []
         clipped = line.intersection(boundary)
         if clipped.is_empty:
             return []
-
         width_m = _parse_width(width_tag, 2.0)
         offset_deg = (width_m / 2) * DEG_PER_METER
-
         edges = []
         segs = _split_geometry(clipped)
         for seg in segs:
             if seg.length == 0:
                 continue
-            # Sidewalk/path center = blow zone
-            edges.append(_edge("blow", "sidewalk", _geom_coords(seg), tags,
-                               "Sidewalk/path — blow zone"))
-            # Left trim edge
+            edges.append(_edge("blow", "sidewalk", _geom_coords(seg), tags, "Sidewalk - blow zone"))
             try:
                 left = offset_curve(seg, offset_deg)
                 left_clipped = left.intersection(boundary)
                 if not left_clipped.is_empty:
-                    edges.append(_edge("trim", "path_left_edge", _geom_coords(left_clipped),
-                                       tags, "Path left edge — trim", "trimmer"))
+                    edges.append(_edge("trim", "path_left_edge", _geom_coords(left_clipped), tags, "Path left - trim", "trimmer"))
             except Exception:
                 pass
-            # Right trim edge
             try:
                 right = offset_curve(seg, -offset_deg)
                 right_clipped = right.intersection(boundary)
                 if not right_clipped.is_empty:
-                    edges.append(_edge("trim", "path_right_edge", _geom_coords(right_clipped),
-                                       tags, "Path right edge — trim", "trimmer"))
+                    edges.append(_edge("trim", "path_right_edge", _geom_coords(right_clipped), tags, "Path right - trim", "trimmer"))
             except Exception:
                 pass
         return edges
 
-    # -----------------------------------------------------------------------
-    # PAVED SURFACES — blow zone + trim perimeter
-    # -----------------------------------------------------------------------
-
-    if surface in ("asphalt", "concrete", "paving_stones", "cobblestone",
-                   "sett", "metal", "wood", "brick", "tiles", "gravel", "compacted"):
+    if surface in ("asphalt", "concrete", "paving_stones", "cobblestone", "sett", "metal", "wood", "brick", "tiles", "gravel", "compacted"):
         if closed and len(coords) >= 3:
             poly = coords_to_polygon(coords)
             if poly and boundary.intersects(poly):
                 clipped_poly = poly.intersection(boundary)
-                edges = [_edge("blow", "paved_area", coords, tags,
-                               "Paved area — blow surface")]
+                edges = [_edge("blow", "paved_area", coords, tags, "Paved area - blow")]
                 perimeter = clipped_poly.exterior if hasattr(clipped_poly, 'exterior') else None
                 if perimeter:
                     segs = _split_geometry(perimeter)
-                    edges += [_edge("trim", "paved_edge", _geom_coords(s), tags,
-                                    "Paved area edge — trim", "trimmer")
-                              for s in segs if s.length > 0]
+                    edges += [_edge("trim", "paved_edge", _geom_coords(s), tags, "Paved edge - trim", "trimmer") for s in segs if s.length > 0]
                 return edges
         line = coords_to_linestring(coords)
         if line:
-            return [_edge("blow", "paved_surface", coords, tags, "Paved surface — blow")]
-
-    # -----------------------------------------------------------------------
-    # TREE LINES — routing obstacle
-    # -----------------------------------------------------------------------
+            return [_edge("blow", "paved_surface", coords, tags, "Paved surface - blow")]
 
     if natural == "tree_row":
         line = coords_to_linestring(coords)
         if line:
             clipped = line.intersection(boundary)
             segs = _split_geometry(clipped)
-            return [_edge("none", "tree_row", _geom_coords(s), tags,
-                          "Tree row — routing obstacle, mow around")
-                    for s in segs if s.length > 0]
-
-    # -----------------------------------------------------------------------
-    # OPEN TURF — mow zones
-    # -----------------------------------------------------------------------
+            return [_edge("none", "tree_row", _geom_coords(s), tags, "Tree row - obstacle") for s in segs if s.length > 0]
 
     if golf in ("fairway", "rough", "lateral_water_hazard"):
         if closed and len(coords) >= 3:
             poly = coords_to_polygon(coords)
             if poly and boundary.intersects(poly):
                 equipment = "riding_mower" if poly.area * 1e10 > 5000 else "walk_behind"
-                return [_edge("mow", "golf_fairway", coords, tags,
-                              f"Golf {golf} — mow zone", equipment)]
+                return [_edge("mow", "golf_fairway", coords, tags, f"Golf {golf} - mow", equipment)]
 
     if landuse in ("grass", "meadow", "recreation_ground", "greenfield") or \
        leisure in ("park", "pitch", "common", "golf_course") or \
@@ -459,24 +386,15 @@ def classify_way(tags: dict, coords: list, boundary: Polygon) -> list:
                 area_sqm = poly.area * 1e10
                 equipment = _mow_equipment_by_area(area_sqm)
                 clipped_poly = poly.intersection(boundary)
-                edges = [_edge("mow", "open_turf", coords, tags,
-                               f"Open turf — {equipment}", equipment)]
+                edges = [_edge("mow", "open_turf", coords, tags, f"Open turf - {equipment}", equipment)]
                 if hasattr(clipped_poly, 'exterior'):
                     perimeter_segs = _split_geometry(clipped_poly.exterior)
-                    edges += [_edge("trim", "turf_perimeter", _geom_coords(s), tags,
-                                    "Turf perimeter — trim edge", "trimmer")
-                              for s in perimeter_segs if s.length > 0]
+                    edges += [_edge("trim", "turf_perimeter", _geom_coords(s), tags, "Turf perimeter - trim", "trimmer") for s in perimeter_segs if s.length > 0]
                 return edges
-
-    # -----------------------------------------------------------------------
-    # DEFAULT — flag for review
-    # -----------------------------------------------------------------------
 
     line = coords_to_linestring(coords)
     if line and boundary.intersects(line):
-        return [_edge("mow", "unclassified", coords, tags,
-                      "Unclassified — assumed mow, needs review",
-                      "walk_behind", needs_review=True)]
+        return [_edge("mow", "unclassified", coords, tags, "Unclassified - assumed mow", "walk_behind", needs_review=True)]
 
     return []
 
@@ -570,16 +488,16 @@ def detect_tight_spaces(edges: list) -> list:
             if min_clearance < TRIMMER_WIDTH:
                 updated["equipment_constraint"] = "inaccessible"
                 updated["tight_space_flag"] = True
-                updated["tight_space_reason"] = f"Corridor {min_clearance:.2f}m — inaccessible"
+                updated["tight_space_reason"] = f"Corridor {min_clearance:.2f}m - inaccessible"
             elif min_clearance < WALK_BEHIND_WIDTH:
                 updated["equipment_constraint"] = "trimmer_only_tight"
                 updated["tight_space_flag"] = True
-                updated["tight_space_reason"] = f"Corridor {min_clearance:.2f}m — trimmer only"
+                updated["tight_space_reason"] = f"Corridor {min_clearance:.2f}m - trimmer only"
             elif min_clearance < RIDING_MOWER_WIDTH:
                 if updated["equipment_constraint"] == "riding_mower":
                     updated["equipment_constraint"] = "walk_behind"
                 updated["tight_space_flag"] = True
-                updated["tight_space_reason"] = f"Corridor {min_clearance:.2f}m — walk-behind max"
+                updated["tight_space_reason"] = f"Corridor {min_clearance:.2f}m - walk-behind max"
             else:
                 updated["tight_space_flag"] = False
         else:
@@ -687,9 +605,10 @@ CREATE INDEX IF NOT EXISTS idx_traversals_job ON osm_edge_traversals(job_id);
 """
 
 def ensure_schema(conn):
-    with conn.cursor() as cur:
-        cur.execute(CREATE_TABLES_SQL)
+    cur = conn.cursor()
+    cur.execute(CREATE_TABLES_SQL)
     conn.commit()
+    cur.close()
     logger.info("OSM graph schema ensured")
 
 # ---------------------------------------------------------------------------
@@ -703,21 +622,22 @@ def build_graph_for_property(property_id: str, triggered_by_user_id: str = None)
     try:
         ensure_schema(conn)
 
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("""
-                SELECT id, name,
-                       ST_AsGeoJSON(boundary) as boundary_geojson,
-                       latitude, longitude
-                FROM properties WHERE id = %s
-            """, (property_id,))
-            prop = cur.fetchone()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, name,
+                   ST_AsGeoJSON(boundary) as boundary_geojson,
+                   latitude, longitude
+            FROM properties WHERE id = %s
+        """, (property_id,))
+        prop = fetchone_dict(cur)
+        cur.close()
 
         if not prop:
             raise ValueError(f"Property {property_id} not found")
 
         boundary_geojson = prop.get("boundary_geojson")
         if not boundary_geojson:
-            raise ValueError(f"Property {property_id} has no boundary — draw it first")
+            raise ValueError(f"Property {property_id} has no boundary - draw it first")
 
         if isinstance(boundary_geojson, str):
             boundary_geojson = json.loads(boundary_geojson)
@@ -745,14 +665,15 @@ def build_graph_for_property(property_id: str, triggered_by_user_id: str = None)
         query_duration_ms = int((time.time() - query_start) * 1000)
         element_count = len(osm_data.get("elements", []))
 
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO osm_raw_cache
-                    (property_id, bbox, element_count, raw_response, overpass_query, query_duration_ms)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, (property_id, bbox_str, element_count, json.dumps(osm_data),
-                  OVERPASS_QUERY_TEMPLATE.replace("{bbox}", bbox_str), query_duration_ms))
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO osm_raw_cache
+                (property_id, bbox, element_count, raw_response, overpass_query, query_duration_ms)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (property_id, bbox_str, element_count, json.dumps(osm_data),
+              OVERPASS_QUERY_TEMPLATE.replace("{bbox}", bbox_str), query_duration_ms))
         conn.commit()
+        cur.close()
         logger.info(f"Cached {element_count} OSM elements in {query_duration_ms}ms")
 
         nodes_by_id, ways = parse_osm_elements(osm_data)
@@ -802,98 +723,97 @@ def build_graph_for_property(property_id: str, triggered_by_user_id: str = None)
         tight_count = sum(1 for e in all_edges if e.get("tight_space_flag"))
         logger.info(f"Tight spaces: {tight_count}")
 
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM osm_graph_edges WHERE property_id = %s", (property_id,))
-            cur.execute("DELETE FROM osm_graph_nodes WHERE property_id = %s", (property_id,))
+        cur = conn.cursor()
+        cur.execute("DELETE FROM osm_graph_edges WHERE property_id = %s", (property_id,))
+        cur.execute("DELETE FROM osm_graph_nodes WHERE property_id = %s", (property_id,))
 
         mow_count = trim_count = blow_count = none_count = needs_review_count = 0
 
-        with conn.cursor() as cur:
-            for edge in all_edges:
-                geom = edge.get("geometry")
-                if not geom or not isinstance(geom, LineString):
-                    continue
+        for edge in all_edges:
+            geom = edge.get("geometry")
+            if not geom or not isinstance(geom, LineString):
+                continue
 
-                task = edge["task_type"]
-                if task == "mow": mow_count += 1
-                elif task == "trim": trim_count += 1
-                elif task == "blow": blow_count += 1
-                else: none_count += 1
-                if edge.get("needs_review"): needs_review_count += 1
+            task = edge["task_type"]
+            if task == "mow": mow_count += 1
+            elif task == "trim": trim_count += 1
+            elif task == "blow": blow_count += 1
+            else: none_count += 1
+            if edge.get("needs_review"): needs_review_count += 1
 
-                # Calculate midpoint for tight space markers
-                try:
-                    midpoint = geom.interpolate(0.5, normalized=True)
-                    midpoint_lat = midpoint.y
-                    midpoint_lng = midpoint.x
-                except Exception:
-                    midpoint_lat = None
-                    midpoint_lng = None
+            try:
+                midpoint = geom.interpolate(0.5, normalized=True)
+                midpoint_lat = midpoint.y
+                midpoint_lng = midpoint.x
+            except Exception:
+                midpoint_lat = None
+                midpoint_lng = None
 
-                cur.execute("""
-                    INSERT INTO osm_graph_edges (
-                        property_id, osm_way_id, geometry, length_m,
-                        task_type, feature_class, equipment_constraint,
-                        tight_space_flag, tight_space_reason, constraining_feature,
-                        measured_corridor_width_m,
-                        classification_reason, needs_review, osm_tags, classified_at
-                    ) VALUES (
-                        %s, %s, ST_GeomFromGeoJSON(%s), %s,
-                        %s, %s, %s,
-                        %s, %s, %s, %s,
-                        %s, %s, %s, %s
-                    )
-                """, (
-                    property_id, edge.get("osm_way_id"),
-                    json.dumps(mapping(geom)), edge.get("length_m"),
-                    edge["task_type"], edge.get("feature_class"),
-                    edge.get("equipment_constraint"),
-                    edge.get("tight_space_flag", False),
-                    edge.get("tight_space_reason"),
-                    edge.get("constraining_feature"),
-                    edge.get("measured_corridor_width_m"),
-                    edge.get("classification_reason"),
-                    edge.get("needs_review", False),
-                    json.dumps(edge.get("osm_tags", {})),
-                    edge.get("classified_at"),
-                ))
+            cur.execute("""
+                INSERT INTO osm_graph_edges (
+                    property_id, osm_way_id, geometry, length_m,
+                    task_type, feature_class, equipment_constraint,
+                    tight_space_flag, tight_space_reason, constraining_feature,
+                    measured_corridor_width_m,
+                    classification_reason, needs_review, osm_tags, classified_at
+                ) VALUES (
+                    %s, %s, ST_GeomFromGeoJSON(%s), %s,
+                    %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s
+                )
+            """, (
+                property_id, edge.get("osm_way_id"),
+                json.dumps(mapping(geom)), edge.get("length_m"),
+                edge["task_type"], edge.get("feature_class"),
+                edge.get("equipment_constraint"),
+                edge.get("tight_space_flag", False),
+                edge.get("tight_space_reason"),
+                edge.get("constraining_feature"),
+                edge.get("measured_corridor_width_m"),
+                edge.get("classification_reason"),
+                edge.get("needs_review", False),
+                json.dumps(edge.get("osm_tags", {})),
+                edge.get("classified_at"),
+            ))
 
         node_count = 0
-        with conn.cursor() as cur:
-            for node_id, node in nodes_by_id.items():
-                tags = node.get("tags", {})
-                if not tags:
-                    continue
-                pt = Point(node["lon"], node["lat"])
-                if not boundary_polygon.contains(pt):
-                    continue
-                node_type = _classify_node(tags)
-                cur.execute("""
-                    INSERT INTO osm_graph_nodes
-                        (property_id, osm_node_id, location, osm_tags, node_type)
-                    VALUES (%s, %s, ST_GeomFromGeoJSON(%s), %s, %s)
-                """, (property_id, node_id, json.dumps(mapping(pt)),
-                      json.dumps(tags), node_type))
-                node_count += 1
+        for node_id, node in nodes_by_id.items():
+            tags = node.get("tags", {})
+            if not tags:
+                continue
+            pt = Point(node["lon"], node["lat"])
+            if not boundary_polygon.contains(pt):
+                continue
+            node_type = _classify_node(tags)
+            cur.execute("""
+                INSERT INTO osm_graph_nodes
+                    (property_id, osm_node_id, location, osm_tags, node_type)
+                VALUES (%s, %s, ST_GeomFromGeoJSON(%s), %s, %s)
+            """, (property_id, node_id, json.dumps(mapping(pt)),
+                  json.dumps(tags), node_type))
+            node_count += 1
 
         conn.commit()
+        cur.close()
         logger.info(f"Stored {len(all_edges)} edges, {node_count} nodes")
 
         build_duration_ms = int((time.time() - build_start) * 1000)
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO osm_graph_build_log (
-                    property_id, triggered_by, build_completed_at,
-                    osm_element_count, edges_created, nodes_created,
-                    mow_edges, trim_edges, blow_edges, none_edges,
-                    tight_spaces_detected, needs_review_count,
-                    build_duration_ms, success
-                ) VALUES (%s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE)
-            """, (property_id, triggered_by_user_id, element_count,
-                  len(all_edges), node_count,
-                  mow_count, trim_count, blow_count, none_count,
-                  tight_count, needs_review_count, build_duration_ms))
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO osm_graph_build_log (
+                property_id, triggered_by, build_completed_at,
+                osm_element_count, edges_created, nodes_created,
+                mow_edges, trim_edges, blow_edges, none_edges,
+                tight_spaces_detected, needs_review_count,
+                build_duration_ms, success
+            ) VALUES (%s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE)
+        """, (property_id, triggered_by_user_id, element_count,
+              len(all_edges), node_count,
+              mow_count, trim_count, blow_count, none_count,
+              tight_count, needs_review_count, build_duration_ms))
         conn.commit()
+        cur.close()
 
         summary = {
             "property_id": property_id,
@@ -914,16 +834,19 @@ def build_graph_for_property(property_id: str, triggered_by_user_id: str = None)
         return summary
 
     except Exception as e:
+        import traceback
         logger.error(f"Graph build failed: {e}")
+        logger.error(traceback.format_exc())
         try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO osm_graph_build_log
-                        (property_id, triggered_by, success, error_message, build_duration_ms)
-                    VALUES (%s, %s, FALSE, %s, %s)
-                """, (property_id, triggered_by_user_id, str(e),
-                      int((time.time() - build_start) * 1000)))
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO osm_graph_build_log
+                    (property_id, triggered_by, success, error_message, build_duration_ms)
+                VALUES (%s, %s, FALSE, %s, %s)
+            """, (property_id, triggered_by_user_id, str(e),
+                  int((time.time() - build_start) * 1000)))
             conn.commit()
+            cur.close()
         except Exception:
             pass
         raise
