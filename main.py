@@ -47,7 +47,7 @@ class OptimizeRequest(BaseModel):
     crew: List[CrewMember]
     equipment: List[Equipment]
     mode: str = "balanced"
-
+    available_crew: Optional[List[CrewMember]] = None
 class TaskAssignment(BaseModel):
     crew_member_id: str
     crew_member_name: str
@@ -325,8 +325,8 @@ def optimize(request: OptimizeRequest):
     if not request.crew:
         raise HTTPException(status_code=400, detail="No crew provided")
 
-    assignments = assign_zones_to_crew(request.zones, request.crew, request.mode)
-
+    all_crew = list(request.crew) + list(request.available_crew or [])
+    assignments = assign_zones_to_crew(request.zones, all_crew, request.mode)
     crew_times = {}
     for a in assignments:
         crew_times[a.crew_member_id] = crew_times.get(a.crew_member_id, 0) + a.estimated_minutes
