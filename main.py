@@ -207,114 +207,53 @@ def assign_zones_to_crew(zones, crew, mode):
             mowers = [c for c in mowers if c not in trimmers]
 
     # --- MODE: CHEAPEST ---
-    # Find optimal crew size by minimizing total labor cost
-    # Labor cost = sum(crew_member.hourly_rate * their_time_on_site_hours)
     if mode == "cheapest":
-        # Required leader: foreman if assigned, else highest paid crew member
-        foreman = get_foreman(crew) or max(crew, key=lambda c: c.hourly_rate)
-        non_foreman = sorted([c for c in crew if c.id != foreman.id], key=lambda c: c.hourly_rate)
+        leader = get_foreman(crew)
+        if not leader:
+            leader = max(crew, key=lambda c: c.hourly_rate)
+        others = sorted([c for c in crew if c.id != leader.id], key=lambda c: c.hourly_rate)
         best_cost = None
         best_assignments = None
-        best_crew_subset = None
-        # Always include foreman, try adding cheapest workers one at a time
-        for extra in range(0, len(non_foreman) + 1):
-            base = [foreman] if foreman else []
-            subset = base + non_foreman[:extra]
-            if not subset:
-                subset = crew[:1]
+        for extra in range(0, len(others) + 1):
+            subset = [leader] + others[:extra]
             subset_load = {c.id: 0 for c in subset}
             subset_assignments = []
             counter = 1
-
-            # Get mowers and trimmers from subset
-            subset_mowers = [c for c in subset if c.primary_role in ["zero_turn", "walk_behind", "riding_mower"]]
-            subset_trimmers = [c for c in subset if c.primary_role == "trimmer"]
-            
+            subset_mowers = [c for c in subset if c.primary_role in ['zero_turn', 'walk_behind', 'riding_mower']]
+            subset_trimmers = [c for c in subset if c.primary_role == 'trimmer']
             if not subset_mowers:
                 subset_mowers = [subset[0]]
             if not subset_trimmers:
-                non_foreman = [c for c in subset_mowers if not c.is_foreman]
-                subset_trimmers = [non_foreman[-1]] if non_foreman else [subset[-1]]
-                subset_mowers = [c for c in subset_mowers if c not in subset_trimmers]
-                if not subset_mowers:
-                    subset_mowers = [subset[0]]
-
-            all_mow = large_fields + small_mow
-            all_mow.sort(key=lambda z: z.area_sqft, reverse=True)
-
+                non_f = [c for c in subset_mowers if not c.is_foreman]
+                subset_trimmers = [non_f[-1]] if non_f else [subset[-1]]
+                subset_mowers = [c for c in subset_mowers if c not in subset_trimmers] or [subset[0]]
+            all_mow = sorted(large_fields + small_mow, key=lambda z: z.area_sqft, reverse=True)
             for zone in all_mow:
                 worker = min(subset_mowers, key=lambda c: subset_load.get(c.id, 0))
-                eq = worker.primary_role if worker.primary_role in CUTTING_SPEED else "walk_behind"
-                mins = estimate_mow_minutes(zone, eq, "balanced")
-                subset_assignments.append(TaskAssignment(
-                    crew_member_id=worker.id,
-                    crew_member_name=worker.name,
-                    task_order=counter,
-                    zone_id=zone.id,
-                    zone_label=zone.label,
-                    task_type="mow",
-                    estimated_minutes=mins,
-                    role_used=eq,
-                    is_role_switch=False
-                ))
+                eq = worker.primary_role if worker.primary_role in CUTTING_SPEED else 'walk_behind'
+                mins = estimate_mow_minutes(zone, eq, 'balanced')
+                subset_assignments.append(TaskAssignment(crew_member_id=worker.id, crew_member_name=worker.name, task_order=counter, zone_id=zone.id, zone_label=zone.label, task_type='mow', estimated_minutes=mins, role_used=eq, is_role_switch=False))
                 subset_load[worker.id] = subset_load.get(worker.id, 0) + mins
                 counter += 1
-
-            trim_zones_sorted = sorted(trim_zones, key=lambda z: estimate_trim_minutes(z, "balanced"), reverse=True)
-            for zone in trim_zones_sorted:
+            for zone in sorted(trim_zones, key=lambda z: estimate_trim_minutes(z, 'balanced'), reverse=True):
                 worker = min(subset_trimmers, key=lambda c: subset_load.get(c.id, 0))
-                worker_tasks = [a for a in subset_assignments if a.crew_member_id == worker.id]
-                last_task = worker_tasks[-1] if worker_tasks else None
-                is_switch = last_task is not None and last_task.task_type == "mow"
-                mins = estimate_trim_minutes(zone, "balanced")
-                if is_switch:
-                    mins += TASK_SWITCH_PENALTY_MINUTES
-                subset_assignments.append(TaskAssignment(
-                    crew_member_id=worker.id,
-                    crew_member_name=worker.name,
-                    task_order=counter,
-                    zone_id=zone.id,
-                    zone_label=zone.label,
-                    task_type="trim",
-                    estimated_minutes=mins,
-                    role_used="trimmer",
-                    is_role_switch=is_switch
-                ))
+                prev = [a for a in subset_assignments if a.crew_member_id == worker.id]
+                is_switch = bool(prev) and prev[-1].task_type == 'mow'
+                mins = estimate_trim_minutes(zone, 'balanced') + (TASK_SWITCH_PENALTY_MINUTES if is_switch else 0)
+                subset_assignments.append(TaskAssignment(crew_member_id=worker.id, crew_member_name=worker.name, task_order=counter, zone_id=zone.id, zone_label=zone.label, task_type='trim', estimated_minutes=mins, role_used='trimmer', is_role_switch=is_switch))
                 subset_load[worker.id] = subset_load.get(worker.id, 0) + mins
                 counter += 1
-
-            blow_mins = estimate_blow_minutes(zones, "balanced") + TASK_SWITCH_PENALTY_MINUTES
+            blow_mins = estimate_blow_minutes(zones, 'balanced') + TASK_SWITCH_PENALTY_MINUTES
             worker = min(subset, key=lambda c: subset_load.get(c.id, 0))
-            subset_assignments.append(TaskAssignment(
-                crew_member_id=worker.id,
-                crew_member_name=worker.name,
-                task_order=counter,
-                zone_id="cleanup",
-                zone_label="Final Blowout & Cleanup",
-                task_type="blow",
-                estimated_minutes=blow_mins,
-                role_used="blower",
-                is_role_switch=True
-            ))
+            subset_assignments.append(TaskAssignment(crew_member_id=worker.id, crew_member_name=worker.name, task_order=counter, zone_id='cleanup', zone_label='Final Blowout & Cleanup', task_type='blow', estimated_minutes=blow_mins, role_used='blower', is_role_switch=True))
             subset_load[worker.id] = subset_load.get(worker.id, 0) + blow_mins
-
-            # Calculate total labor cost for this crew size
-            # Job duration = max individual time (parallel work)
             job_duration_hours = max(subset_load.values()) / 60.0
-            total_cost = sum(
-                c.hourly_rate * job_duration_hours
-                for c in subset
-            )
-
+            total_cost = sum(c.hourly_rate * job_duration_hours for c in subset)
             if best_cost is None or total_cost < best_cost:
                 best_cost = total_cost
                 best_assignments = subset_assignments
-                best_crew_subset = subset
-
-        # Update crew_load for the winning subset
         for a in best_assignments:
             crew_load[a.crew_member_id] = crew_load.get(a.crew_member_id, 0) + a.estimated_minutes
-
         return best_assignments
 
     # --- MODE: FASTEST / BALANCED ---
