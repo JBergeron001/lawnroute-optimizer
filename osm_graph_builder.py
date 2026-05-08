@@ -487,10 +487,9 @@ def detect_tight_spaces(edges: list) -> list:
         updated = dict(edge)
         if min_clearance is not None:
             updated["measured_corridor_width_m"] = round(min_clearance, 3)
-            cd C:\Users\azabu\LawnRoute\lawnroute-optimizer
-git add .
-git commit -m "Fix tight space indentation"
-git push
+            updated["constraining_feature"] = constraining_feature
+            if min_clearance < TRIMMER_WIDTH:
+                updated["equipment_constraint"] = "inaccessible"
                 updated["tight_space_flag"] = True
                 updated["tight_space_reason"] = f"Corridor {min_clearance:.2f}m - inaccessible"
             elif min_clearance < WALK_BEHIND_WIDTH:
