@@ -1,4 +1,4 @@
-;"""
+"""
 LawnRoute OSM Graph Builder v3
 Improved classification engine with correct handling of:
 - Golf course features (bunkers, greens, fairways, paths)
