@@ -159,6 +159,18 @@ def estimate_trim_minutes(zone: Zone, mode: str = 'balanced') -> int:
         minutes = int(minutes * 1.3)
     minutes = int(minutes * 5.0)
     return max(minutes, 2)
+
+def estimate_blow_minutes(all_zones: List[Zone], mode: str = 'balanced') -> int:
+    BLOWER_FT_PER_MIN = 325
+    total_perimeter = 0
+    for z in all_zones:
+        if z.zone_type in ['trim', 'perimeter', 'mow', 'berm', 'courtyard']:
+            if z.perimeter_ft and z.perimeter_ft > 0:
+                total_perimeter += z.perimeter_ft
+            else:
+                total_perimeter += 4 * (z.area_sqft ** 0.5)
+    return max(int(total_perimeter / BLOWER_FT_PER_MIN * 5.0), 5)
+
     BLOWER_FT_PER_MIN = 325
     total_perimeter = 0
     for z in all_zones:
