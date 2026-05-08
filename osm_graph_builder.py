@@ -1,4 +1,4 @@
-"""
+;"""
 LawnRoute OSM Graph Builder v3
 Improved classification engine with correct handling of:
 - Golf course features (bunkers, greens, fairways, paths)
@@ -478,7 +478,7 @@ def detect_tight_spaces(edges: list) -> list:
                 continue
             try:
                 dist_m = geom_a.distance(geom_b) * 111320
-                if min_clearance is None or dist_m < min_clearance:
+                if dist_m < 50 and (min_clearance is None or dist_m < min_clearance):
                     min_clearance = dist_m
                     constraining_feature = other.get("feature_class", "unknown")
             except Exception:
