@@ -205,24 +205,13 @@ def assign_zones_to_crew(zones, crew, mode):
 
     # Enforce minimum 2 crew
     if len(ordered_crew) < 2:
-        ordered_crew = ordered_crew * 2  # single person does everything
+        ordered_crew = ordered_crew + ordered_crew
 
-    # Leader is always first, trimmer is always lowest paid
-    leader = ordered_crew[0]
-    lowest_paid = ordered_crew[-1]
-
-    # Build subsets from size 2 up to full crew
-    best_score = None
-    best_assignments = None
-    best_subset_size = 2
-
-    for size in range(2, len(ordered_crew) + 1):
-        subset = ordered_crew[:size]
+    def run_subset(subset, mode):
         subset_load = {c.id: 0.0 for c in subset}
         subset_assignments = []
         counter = 1
 
-        # Identify mowers and trimmers in this subset
         subset_mowers = [c for c in subset if c.primary_role in ['zero_turn', 'walk_behind', 'riding_mower']]
         subset_trimmers = [c for c in subset if c.primary_role == 'trimmer']
         if not subset_mowers:
@@ -232,7 +221,6 @@ def assign_zones_to_crew(zones, crew, mode):
             subset_trimmers = [non_foreman[-1]] if non_foreman else [subset[-1]]
             subset_mowers = [c for c in subset_mowers if c not in subset_trimmers] or [subset[0]]
 
-        # Assign mow zones
         all_mow = sorted(large_fields + small_mow, key=lambda z: z.area_sqft, reverse=True)
         for zone in all_mow:
             worker = min(subset_mowers, key=lambda c: subset_load.get(c.id, 0))
@@ -246,7 +234,6 @@ def assign_zones_to_crew(zones, crew, mode):
             subset_load[worker.id] = subset_load.get(worker.id, 0) + mins
             counter += 1
 
-        # Assign trim zones
         for zone in sorted(trim_zones, key=lambda z: estimate_trim_minutes(z, mode), reverse=True):
             worker = min(subset_trimmers, key=lambda c: subset_load.get(c.id, 0))
             prev = [a for a in subset_assignments if a.crew_member_id == worker.id]
@@ -260,7 +247,6 @@ def assign_zones_to_crew(zones, crew, mode):
             subset_load[worker.id] = subset_load.get(worker.id, 0) + mins
             counter += 1
 
-        # Assign blow
         blow_mins = estimate_blow_minutes(zones, mode) + TASK_SWITCH_PENALTY_MINUTES
         blow_worker = min(subset, key=lambda c: subset_load.get(c.id, 0))
         subset_assignments.append(TaskAssignment(
@@ -270,25 +256,60 @@ def assign_zones_to_crew(zones, crew, mode):
         ))
         subset_load[blow_worker.id] = subset_load.get(blow_worker.id, 0) + blow_mins
 
-        # Calculate metrics
-        job_time = max(subset_load.values())  # minutes to complete job
-        wage_cost = sum(subset_load.get(c.id, 0) * c.hourly_rate / 60 for c in subset)  # total wage bill
+        job_time = max(subset_load.values())
+        wage_cost = sum(subset_load.get(c.id, 0) * c.hourly_rate / 60 for c in subset)
+        return subset_assignments, job_time, wage_cost
 
-        # Score based on mode
-        if mode == 'fastest':
-            score = job_time  # lower is better
-        elif mode == 'cheapest':
-            score = wage_cost  # lower is better
-        else:  # balanced
-            score = job_time * wage_cost  # minimize both together
+    if mode == 'cheapest':
+        # Start with 2 crew, add more only if wage bill goes DOWN
+        best_assignments, best_time, best_cost = run_subset(ordered_crew[:2], mode)
+        print(f'CHEAPEST size=2 cost={best_cost:.2f}')
+        for size in range(3, len(ordered_crew) + 1):
+            subset = ordered_crew[:size]
+            assignments, job_time, wage_cost = run_subset(subset, mode)
+            print(f'CHEAPEST size={size} cost={wage_cost:.2f}')
+            if wage_cost < best_cost:
+                best_cost = wage_cost
+                best_assignments = assignments
+                best_time = job_time
+            else:
+                break  # cost went up, stop adding crew
+        print(f'CHEAPEST final cost=')
+        return best_assignments
 
-        if best_score is None or score < best_score:
-            best_score = score
-            best_assignments = subset_assignments
-            best_subset_size = size
+    elif mode == 'fastest':
+        # Find crew size that minimizes job completion time
+        best_assignments, best_time, best_cost = run_subset(ordered_crew[:2], mode)
+        print(f'FASTEST size=2 time={best_time:.0f}min')
+        for size in range(3, len(ordered_crew) + 1):
+            subset = ordered_crew[:size]
+            assignments, job_time, wage_cost = run_subset(subset, mode)
+            print(f'FASTEST size={size} time={job_time:.0f}min')
+            if job_time < best_time:
+                best_time = job_time
+                best_assignments = assignments
+            else:
+                break  # time not improving, stop adding crew
+        print(f'FASTEST final time={best_time:.0f}min')
+        return best_assignments
 
-    print(f'MODE={mode} best_size={best_subset_size} score={best_score:.2f}')
-    return best_assignments if best_assignments else []
+    else:  # balanced
+        # Find best time/cost ratio
+        best_assignments, best_time, best_cost = run_subset(ordered_crew[:2], mode)
+        best_score = best_time * best_cost
+        print(f'BALANCED size=2 score={best_score:.2f}')
+        for size in range(3, len(ordered_crew) + 1):
+            subset = ordered_crew[:size]
+            assignments, job_time, wage_cost = run_subset(subset, mode)
+            score = job_time * wage_cost
+            print(f'BALANCED size={size} score={score:.2f}')
+            if score < best_score:
+                best_score = score
+                best_assignments = assignments
+            else:
+                break
+        print(f'BALANCED final score={best_score:.2f}')
+        return best_assignments
 # --- Routes ---
 
 @app.get("/health")
