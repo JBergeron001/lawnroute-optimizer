@@ -187,232 +187,108 @@ def classify_zones(zones: list):
 # --- Core assignment logic ---
 
 def assign_zones_to_crew(zones, crew, mode):
-    assignments = []
-    task_counter = 1
-    crew_load = {c.id: 0 for c in crew}
-
+    FALLBACK_WAGE = 20.60
     large_fields, small_mow, trim_zones, workable_zones = classify_zones(zones)
 
-    mowers = get_mowers(crew)
-    trimmers = get_trimmers(crew)
-    all_crew = crew
+    # Ensure all crew have a wage - use fallback if missing
+    for c in crew:
+        if not c.hourly_rate or c.hourly_rate == 0:
+            c.hourly_rate = FALLBACK_WAGE
 
-    # If no dedicated trimmers, pull lowest-paid non-foreman mowers for trim
-    if not trimmers:
-        non_foreman_mowers = [c for c in mowers if not c.is_foreman]
-        if non_foreman_mowers:
-            # Pull bottom wage earners for trim based on crew size
-            trim_count = max(1, len(crew) // 4) if len(crew) >= 4 else 1
-            trimmers = non_foreman_mowers[-trim_count:]
-            mowers = [c for c in mowers if c not in trimmers]
+    # Sort crew: foreman first, then by wage descending
+    foreman = get_foreman(crew)
+    if foreman:
+        others = sorted([c for c in crew if c.id != foreman.id], key=lambda c: c.hourly_rate, reverse=True)
+        ordered_crew = [foreman] + others
+    else:
+        ordered_crew = sorted(crew, key=lambda c: c.hourly_rate, reverse=True)
 
-    # --- MODE: CHEAPEST ---
-    if mode == 'cheapest':
-        leader = get_foreman(crew)
-        print(f'CHEAPEST DEBUG: crew={len(crew)}, foreman={leader.name if leader else None}')
-        if not leader:
-            leader = max(crew, key=lambda c: c.hourly_rate)
-        others = sorted([c for c in crew if c.id != leader.id], key=lambda c: c.hourly_rate)
-        # Pick cheapest trimmer - lowest paid non-foreman
-        non_foreman = [c for c in crew if not c.is_foreman and c.id != leader.id]
-        trimmer = min(non_foreman, key=lambda c: c.hourly_rate) if non_foreman else leader
-        cheap_assignments = []
+    # Enforce minimum 2 crew
+    if len(ordered_crew) < 2:
+        ordered_crew = ordered_crew * 2  # single person does everything
+
+    # Leader is always first, trimmer is always lowest paid
+    leader = ordered_crew[0]
+    lowest_paid = ordered_crew[-1]
+
+    # Build subsets from size 2 up to full crew
+    best_score = None
+    best_assignments = None
+    best_subset_size = 2
+
+    for size in range(2, len(ordered_crew) + 1):
+        subset = ordered_crew[:size-1] + [ordered_crew[-1]] if size < len(ordered_crew) else ordered_crew[:size]
+        subset_load = {c.id: 0.0 for c in subset}
+        subset_assignments = []
         counter = 1
+
+        # Identify mowers and trimmers in this subset
+        subset_mowers = [c for c in subset if c.primary_role in ['zero_turn', 'walk_behind', 'riding_mower']]
+        subset_trimmers = [c for c in subset if c.primary_role == 'trimmer']
+        if not subset_mowers:
+            subset_mowers = [subset[0]]
+        if not subset_trimmers:
+            non_foreman = [c for c in subset if not c.is_foreman and c.id != subset[0].id]
+            subset_trimmers = [non_foreman[-1]] if non_foreman else [subset[-1]]
+            subset_mowers = [c for c in subset_mowers if c not in subset_trimmers] or [subset[0]]
+
+        # Assign mow zones
         all_mow = sorted(large_fields + small_mow, key=lambda z: z.area_sqft, reverse=True)
         for zone in all_mow:
-            eq = leader.primary_role if leader.primary_role in CUTTING_SPEED else 'walk_behind'
+            worker = min(subset_mowers, key=lambda c: subset_load.get(c.id, 0))
+            eq = worker.primary_role if worker.primary_role in CUTTING_SPEED else 'walk_behind'
             mins = estimate_mow_minutes(zone, eq, mode)
-            cheap_assignments.append(TaskAssignment(crew_member_id=leader.id, crew_member_name=leader.name, task_order=counter, zone_id=zone.id, zone_label=zone.label, task_type='mow', estimated_minutes=mins, role_used=eq, is_role_switch=False))
+            subset_assignments.append(TaskAssignment(
+                crew_member_id=worker.id, crew_member_name=worker.name,
+                task_order=counter, zone_id=zone.id, zone_label=zone.label,
+                task_type='mow', estimated_minutes=mins, role_used=eq, is_role_switch=False
+            ))
+            subset_load[worker.id] = subset_load.get(worker.id, 0) + mins
             counter += 1
+
+        # Assign trim zones
         for zone in sorted(trim_zones, key=lambda z: estimate_trim_minutes(z, mode), reverse=True):
-            mins = estimate_trim_minutes(zone, mode)
-            cheap_assignments.append(TaskAssignment(crew_member_id=trimmer.id, crew_member_name=trimmer.name, task_order=counter, zone_id=zone.id, zone_label=zone.label, task_type='trim', estimated_minutes=mins, role_used='trimmer', is_role_switch=False))
+            worker = min(subset_trimmers, key=lambda c: subset_load.get(c.id, 0))
+            prev = [a for a in subset_assignments if a.crew_member_id == worker.id]
+            is_switch = bool(prev) and prev[-1].task_type == 'mow'
+            mins = estimate_trim_minutes(zone, mode) + (TASK_SWITCH_PENALTY_MINUTES if is_switch else 0)
+            subset_assignments.append(TaskAssignment(
+                crew_member_id=worker.id, crew_member_name=worker.name,
+                task_order=counter, zone_id=zone.id, zone_label=zone.label,
+                task_type='trim', estimated_minutes=mins, role_used='trimmer', is_role_switch=is_switch
+            ))
+            subset_load[worker.id] = subset_load.get(worker.id, 0) + mins
             counter += 1
+
+        # Assign blow
         blow_mins = estimate_blow_minutes(zones, mode) + TASK_SWITCH_PENALTY_MINUTES
-        cheap_assignments.append(TaskAssignment(crew_member_id=trimmer.id, crew_member_name=trimmer.name, task_order=counter, zone_id='cleanup', zone_label='Final Blowout & Cleanup', task_type='blow', estimated_minutes=blow_mins, role_used='blower', is_role_switch=True))
-        return cheap_assignments
-
-    # --- MODE: FASTEST / BALANCED ---
-
-    # PHASE 1: Large fields — assign one dedicated mower each
-    # Only split a large field if extraordinarily large (>10 acres) AND 2+ mowers available
-    for zone in large_fields:
-        if mowers:
-            # Pick least loaded mower
-            worker = min(mowers, key=lambda c: crew_load.get(c.id, 0))
-        else:
-            worker = min(all_crew, key=lambda c: crew_load.get(c.id, 0))
-
-        eq = worker.primary_role if worker.primary_role in CUTTING_SPEED else "walk_behind"
-        mins = estimate_mow_minutes(zone, eq, mode)
-
-        # Extraordinarily large field (>10 acres) with 2+ mowers — split it
-        field_acres = zone.area_sqft / 43560
-        if field_acres > LARGE_FIELD_ACRES and len(mowers) >= 2:
-            # Two mowers split the field — each gets half the time
-            half_mins = max(mins // 2, 2)
-            second_mower = min(
-                [m for m in mowers if m.id != worker.id],
-                key=lambda c: crew_load.get(c.id, 0)
-            )
-            eq2 = second_mower.primary_role if second_mower.primary_role in CUTTING_SPEED else "walk_behind"
-
-            assignments.append(TaskAssignment(
-                crew_member_id=worker.id,
-                crew_member_name=worker.name,
-                task_order=task_counter,
-                zone_id=zone.id,
-                zone_label=f"{zone.label} (North Half)",
-                task_type="mow",
-                estimated_minutes=half_mins,
-                role_used=eq,
-                is_role_switch=False
-            ))
-            crew_load[worker.id] = crew_load.get(worker.id, 0) + half_mins
-            task_counter += 1
-
-            assignments.append(TaskAssignment(
-                crew_member_id=second_mower.id,
-                crew_member_name=second_mower.name,
-                task_order=task_counter,
-                zone_id=zone.id,
-                zone_label=f"{zone.label} (South Half)",
-                task_type="mow",
-                estimated_minutes=half_mins,
-                role_used=eq2,
-                is_role_switch=False
-            ))
-            crew_load[second_mower.id] = crew_load.get(second_mower.id, 0) + half_mins
-            task_counter += 1
-        else:
-            # Normal large field — one mower handles it alone
-            assignments.append(TaskAssignment(
-                crew_member_id=worker.id,
-                crew_member_name=worker.name,
-                task_order=task_counter,
-                zone_id=zone.id,
-                zone_label=zone.label,
-                task_type="mow",
-                estimated_minutes=mins,
-                role_used=eq,
-                is_role_switch=False
-            ))
-            crew_load[worker.id] = crew_load.get(worker.id, 0) + mins
-            task_counter += 1
-
-    # PHASE 2: Small mow zones — distribute across mowers by load balancing
-    small_mow.sort(key=lambda z: z.area_sqft, reverse=True)
-
-    for zone in small_mow:
-        if mowers:
-            worker = min(mowers, key=lambda c: crew_load.get(c.id, 0))
-        else:
-            worker = min(all_crew, key=lambda c: crew_load.get(c.id, 0))
-
-        eq = worker.primary_role if worker.primary_role in CUTTING_SPEED else "walk_behind"
-        mins = estimate_mow_minutes(zone, eq, mode)
-        assignments.append(TaskAssignment(
-            crew_member_id=worker.id,
-            crew_member_name=worker.name,
-            task_order=task_counter,
-            zone_id=zone.id,
-            zone_label=zone.label,
-            task_type="mow",
-            estimated_minutes=mins,
-            role_used=eq,
-            is_role_switch=False
+        blow_worker = min(subset, key=lambda c: subset_load.get(c.id, 0))
+        subset_assignments.append(TaskAssignment(
+            crew_member_id=blow_worker.id, crew_member_name=blow_worker.name,
+            task_order=counter, zone_id='cleanup', zone_label='Final Blowout & Cleanup',
+            task_type='blow', estimated_minutes=blow_mins, role_used='blower', is_role_switch=True
         ))
-        crew_load[worker.id] = crew_load.get(worker.id, 0) + mins
-        task_counter += 1
+        subset_load[blow_worker.id] = subset_load.get(blow_worker.id, 0) + blow_mins
 
-    # PHASE 3: Trim zones — assign to trimmers, balance load
-    trim_zones.sort(key=lambda z: estimate_trim_minutes(z, mode), reverse=True)
-    trim_workers = trimmers if trimmers else all_crew
+        # Calculate metrics
+        job_time = max(subset_load.values())  # minutes to complete job
+        wage_cost = sum(subset_load.get(c.id, 0) * c.hourly_rate / 60 for c in subset)  # total wage bill
 
-    for zone in trim_zones:
-        worker = min(trim_workers, key=lambda c: crew_load.get(c.id, 0))
-        mins = estimate_trim_minutes(zone, mode)
+        # Score based on mode
+        if mode == 'fastest':
+            score = job_time  # lower is better
+        elif mode == 'cheapest':
+            score = wage_cost  # lower is better
+        else:  # balanced
+            score = job_time * wage_cost  # minimize both together
 
-        worker_tasks = [a for a in assignments if a.crew_member_id == worker.id]
-        last_task = worker_tasks[-1] if worker_tasks else None
-        is_switch = last_task is not None and last_task.task_type == "mow"
-        if is_switch:
-            mins += TASK_SWITCH_PENALTY_MINUTES
+        if best_score is None or score < best_score:
+            best_score = score
+            best_assignments = subset_assignments
+            best_subset_size = size
 
-        assignments.append(TaskAssignment(
-            crew_member_id=worker.id,
-            crew_member_name=worker.name,
-            task_order=task_counter,
-            zone_id=zone.id,
-            zone_label=zone.label,
-            task_type="trim",
-            estimated_minutes=mins,
-            role_used="trimmer",
-            is_role_switch=is_switch
-        ))
-        crew_load[worker.id] = crew_load.get(worker.id, 0) + mins
-        task_counter += 1
-
-    # PHASE 4: Blow — assign to whoever finishes first
-    # In real-time this is dynamic, but here we schedule it for the
-    # least loaded crew member(s) to start as mow+trim sections complete
-    blow_mins = estimate_blow_minutes(zones, mode) + TASK_SWITCH_PENALTY_MINUTES
-    total_acres = sum(z.area_sqft for z in workable_zones) / 43560
-
-    if mode == "fastest" and len(crew) >= 2:
-        sorted_crew = sorted(all_crew, key=lambda c: crew_load.get(c.id, 0))
-        num_blowers = min(len(crew), 3)
-        blow_per_person = max(int(blow_mins / num_blowers), 5)
-        for i in range(num_blowers):
-            worker = sorted_crew[i]
-            label = f"Final Blowout & Cleanup (Section {i+1})" if num_blowers > 1 else "Final Blowout & Cleanup"
-            assignments.append(TaskAssignment(
-                crew_member_id=worker.id,
-                crew_member_name=worker.name,
-                task_order=task_counter,
-                zone_id="cleanup",
-                zone_label=label,
-                task_type="blow",
-                estimated_minutes=blow_per_person,
-                role_used="blower",
-                is_role_switch=True
-            ))
-            crew_load[worker.id] = crew_load.get(worker.id, 0) + blow_per_person
-            task_counter += 1
-    elif total_acres > 5 and len(crew) >= 2:
-        sorted_crew = sorted(all_crew, key=lambda c: crew_load.get(c.id, 0))
-        blow_per_person = max(int(blow_mins / 2), 5)
-        for i in range(min(2, len(sorted_crew))):
-            worker = sorted_crew[i]
-            assignments.append(TaskAssignment(
-                crew_member_id=worker.id,
-                crew_member_name=worker.name,
-                task_order=task_counter,
-                zone_id="cleanup",
-                zone_label=f"Final Blowout & Cleanup {'(Zone A)' if i == 0 else '(Zone B)'}",
-                task_type="blow",
-                estimated_minutes=blow_per_person,
-                role_used="blower",
-                is_role_switch=True
-            ))
-            crew_load[worker.id] = crew_load.get(worker.id, 0) + blow_per_person
-            task_counter += 1
-    else:
-        worker = min(all_crew, key=lambda c: crew_load.get(c.id, 0))
-        assignments.append(TaskAssignment(
-            crew_member_id=worker.id,
-            crew_member_name=worker.name,
-            task_order=task_counter,
-            zone_id="cleanup",
-            zone_label="Final Blowout & Cleanup",
-            task_type="blow",
-            estimated_minutes=blow_mins,
-            role_used="blower",
-            is_role_switch=True
-        ))
-
-    return assignments
-
+    print(f'MODE={mode} best_size={best_subset_size} score={best_score:.2f}')
+    return best_assignments if best_assignments else []
 # --- Routes ---
 
 @app.get("/health")
