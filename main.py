@@ -169,18 +169,18 @@ def estimate_blow_minutes(all_zones: List[Zone], mode: str = 'balanced') -> int:
                 total_perimeter += 4 * (z.area_sqft ** 0.5)
     minutes = max(int(total_perimeter / BLOWER_FT_PER_MIN), 5)
     return minutes
-    - small_mow: smaller mow zones distributed across mowers
-    - trim_zones: trim/perimeter zones
-    - no_mow: skip
-    """
-    workable = [z for z in zones if z.zone_type != "no_mow"]
-    mow_zones = [z for z in workable if z.zone_type in ["mow", "berm", "island", "courtyard"]]
-    trim_zones = [z for z in workable if z.zone_type in ["trim", "perimeter"]]
 
-    large_fields = [z for z in mow_zones
-                    if z.area_sqft >= (LARGE_FIELD_ACRES * 43560)
-                    and not z.equipment_restriction]
+def classify_zones(zones: list):
+    workable = [z for z in zones if z.zone_type != 'no_mow']
+    mow_zones = [z for z in workable if z.zone_type in ['mow', 'berm', 'island', 'courtyard']]
+    trim_zones = [z for z in workable if z.zone_type in ['trim', 'perimeter']]
+    large_fields = [z for z in mow_zones if z.area_sqft >= (LARGE_FIELD_ACRES * 43560) and not z.equipment_restriction]
     small_mow = [z for z in mow_zones if z not in large_fields]
+
+
+
+
+
 
     return large_fields, small_mow, trim_zones, workable
 
