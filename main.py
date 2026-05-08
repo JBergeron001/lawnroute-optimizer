@@ -103,11 +103,11 @@ TASK_SWITCH_PENALTY_MINUTES = 8
 LARGE_FIELD_ACRES = 10.0
 
 # --- Mode multipliers ---
-MODE_SPEED_MULTIPLIER = {
-    "fastest": 0.85,
-    "balanced": 1.0,
-    "cheapest": 1.15,
-}
+
+
+
+
+
 
 # --- Estimators ---
 
@@ -128,7 +128,7 @@ def estimate_mow_minutes(zone: Zone, equipment_type: str, mode: str = "balanced"
         minutes = int(minutes * 1.25)
     if zone.zone_type in ["berm", "courtyard"]:
         minutes = int(minutes * 1.4)
-    minutes = int(minutes * MODE_SPEED_MULTIPLIER.get(mode, 1.0))
+
     return max(minutes, 2)
 
 def estimate_trim_minutes(zone: Zone, mode: str = "balanced") -> int:
@@ -139,14 +139,14 @@ def estimate_trim_minutes(zone: Zone, mode: str = "balanced") -> int:
     minutes = max(int(linear_ft / TRIMMER_FT_PER_MIN), 2)
     if zone.slope_grade > 10:
         minutes = int(minutes * 1.3)
-    minutes = int(minutes * MODE_SPEED_MULTIPLIER.get(mode, 1.0))
+
     return max(minutes, 2)
 
 def estimate_blow_minutes(all_zones: List[Zone], mode: str = "balanced") -> int:
     total_sqft = sum(z.area_sqft for z in all_zones if z.zone_type != "no_mow")
     total_acres = total_sqft / 43560
     minutes = max(int(total_acres * 12), 10)
-    minutes = int(minutes * MODE_SPEED_MULTIPLIER.get(mode, 1.0))
+
     return max(minutes, 5)
 
 # --- Role classification helpers ---
