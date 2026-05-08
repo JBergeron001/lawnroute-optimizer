@@ -207,12 +207,13 @@ def assign_zones_to_crew(zones, crew, mode):
             mowers = [c for c in mowers if c not in trimmers]
 
     # --- MODE: CHEAPEST ---
-    if mode == "cheapest":
+    if mode == 'cheapest':
         leader = get_foreman(crew)
         print(f'CHEAPEST DEBUG: crew={len(crew)}, foreman={leader.name if leader else None}')
         if not leader:
             leader = max(crew, key=lambda c: c.hourly_rate)
         others = sorted([c for c in crew if c.id != leader.id], key=lambda c: c.hourly_rate)
+        best_cost = None
         best_assignments = None
         for extra in range(0, len(others) + 1):
             subset = [leader] + others[:extra]
@@ -224,8 +225,7 @@ def assign_zones_to_crew(zones, crew, mode):
             if not subset_mowers:
                 subset_mowers = [subset[0]]
             if not subset_trimmers:
-                non_f = [c for c in subset_mowers if not c.is_foreman]
-                subset_trimmers = [non_f[-1]] if non_f else [subset[-1]]
+                subset_trimmers = [subset[-1]]
                 subset_mowers = [c for c in subset_mowers if c not in subset_trimmers] or [subset[0]]
             all_mow = sorted(large_fields + small_mow, key=lambda z: z.area_sqft, reverse=True)
             for zone in all_mow:
