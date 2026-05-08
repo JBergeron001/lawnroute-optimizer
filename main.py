@@ -144,7 +144,7 @@ def estimate_mow_minutes(zone: Zone, equipment_type: str, mode: str = 'balanced'
         else:
             complexity = 1.0
     else:
-        complexity = 3.5
+        complexity = 5.0  # no perimeter data - assume extreme complexity
     minutes = int(minutes * complexity)
     return max(minutes, 2)
 
