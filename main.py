@@ -142,19 +142,19 @@ def estimate_trim_minutes(zone: Zone, mode: str = "balanced") -> int:
 
     return max(minutes, 2)
 
-def estimate_blow_minutes(all_zones: List[Zone], mode: str = "balanced") -> int:
-    total_sqft = sum(z.area_sqft for z in all_zones if z.zone_type != "no_mow")
-    total_acres = total_sqft / 43560
-    minutes = max(int(total_acres * 12), 10)
+def estimate_blow_minutes(all_zones: List[Zone], mode: str = 'balanced') -> int:
+    # Blow clears boundaries around trim zones - based on perimeter length not area
+    BLOWER_FT_PER_MIN = 325  # blower walks at 3.72 mph along edges
+    total_perimeter = 0
+    for z in all_zones:
+        if z.zone_type in ['trim', 'perimeter', 'mow', 'berm', 'courtyard']:
+            if z.perimeter_ft and z.perimeter_ft > 0:
+                total_perimeter += z.perimeter_ft
+            else:
+                total_perimeter += 4 * (z.area_sqft ** 0.5)
+    minutes = max(int(total_perimeter / BLOWER_FT_PER_MIN), 5)
+    return minutes
 
-    return max(minutes, 5)
-
-# --- Role classification helpers ---
-
-def get_mowers(crew: list) -> list:
-    """Return crew sorted by wage descending — highest paid mow."""
-    mowers = [c for c in crew if c.primary_role in ["zero_turn", "walk_behind", "riding_mower"]]
-    return sorted(mowers, key=lambda c: c.hourly_rate, reverse=True)
 
 def get_trimmers(crew: list) -> list:
     """Return crew assigned to trim — lowest paid non-foreman workers."""
@@ -221,38 +221,38 @@ def assign_zones_to_crew(zones, crew, mode):
             subset_trimmers = [non_foreman[-1]] if non_foreman else [subset[-1]]
             subset_mowers = [c for c in subset_mowers if c not in subset_trimmers] or [subset[0]]
 
-        # --- MOW ZONE SPLITTING ---
-        # If more mowers than zones, split largest zones so all mowers have work
+        # --- MOW ZONE DISTRIBUTION ---
+        # Distribute zones across mowers by load balancing
+        # If more mowers than zones, split total mow time equally
         all_mow = sorted(large_fields + small_mow, key=lambda z: z.area_sqft, reverse=True)
-        expanded_mow = []
-        for zone in all_mow:
-            if len(subset_mowers) > len(expanded_mow) + (len(all_mow) - all_mow.index(zone) - 1):
-                # Split this zone across remaining idle mowers
-                idle_mowers = len(subset_mowers) - len(expanded_mow)
-                if idle_mowers > 1:
-                    section_sqft = zone.area_sqft / idle_mowers
-                    for i in range(idle_mowers):
-                        from copy import copy
-                        z_copy = copy(zone)
-                        z_copy.area_sqft = section_sqft
-                        z_copy.label = f'{zone.label} (Section {i+1})'
-                        expanded_mow.append(z_copy)
-                else:
-                    expanded_mow.append(zone)
-            else:
-                expanded_mow.append(zone)
+        total_mow_mins = sum(estimate_mow_minutes(z, subset_mowers[0].primary_role if subset_mowers[0].primary_role in CUTTING_SPEED else 'walk_behind', mode) for z in all_mow)
+        if len(subset_mowers) >= len(all_mow) and len(all_mow) > 0:
+            # More mowers than zones - give each mower equal share of total time
+            mins_per_mower = total_mow_mins / len(subset_mowers)
+            for i, worker in enumerate(subset_mowers):
+                eq = worker.primary_role if worker.primary_role in CUTTING_SPEED else 'walk_behind'
+                subset_assignments.append(TaskAssignment(
+                    crew_member_id=worker.id, crew_member_name=worker.name,
+                    task_order=counter, zone_id=all_mow[0].id, zone_label=f'Mow Section {i+1}',
+                    task_type='mow', estimated_minutes=int(mins_per_mower), role_used=eq, is_role_switch=False
+                ))
+                subset_load[worker.id] = subset_load.get(worker.id, 0) + mins_per_mower
+                counter += 1
+        else:
+            # Distribute zones across mowers by load balancing
+            for zone in all_mow:
+                worker = min(subset_mowers, key=lambda c: subset_load.get(c.id, 0))
+                eq = worker.primary_role if worker.primary_role in CUTTING_SPEED else 'walk_behind'
+                mins = estimate_mow_minutes(zone, eq, mode)
+                subset_assignments.append(TaskAssignment(
+                    crew_member_id=worker.id, crew_member_name=worker.name,
+                    task_order=counter, zone_id=zone.id, zone_label=zone.label,
+                    task_type='mow', estimated_minutes=mins, role_used=eq, is_role_switch=False
+                ))
+                subset_load[worker.id] = subset_load.get(worker.id, 0) + mins
+                counter += 1
 
-        for zone in expanded_mow:
-            worker = min(subset_mowers, key=lambda c: subset_load.get(c.id, 0))
-            eq = worker.primary_role if worker.primary_role in CUTTING_SPEED else 'walk_behind'
-            mins = estimate_mow_minutes(zone, eq, mode)
-            subset_assignments.append(TaskAssignment(
-                crew_member_id=worker.id, crew_member_name=worker.name,
-                task_order=counter, zone_id=zone.id, zone_label=zone.label,
-                task_type='mow', estimated_minutes=mins, role_used=eq, is_role_switch=False
-            ))
-            subset_load[worker.id] = subset_load.get(worker.id, 0) + mins
-            counter += 1
+
 
         # --- TRIM ZONE SPLITTING ---
         # If more trimmers than zones, split largest trim zones
