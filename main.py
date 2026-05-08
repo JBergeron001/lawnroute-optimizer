@@ -217,7 +217,7 @@ def assign_zones_to_crew(zones, crew, mode):
     best_subset_size = 2
 
     for size in range(2, len(ordered_crew) + 1):
-        subset = ordered_crew[:size-1] + [ordered_crew[-1]] if size < len(ordered_crew) else ordered_crew[:size]
+        subset = ordered_crew[:size]
         subset_load = {c.id: 0.0 for c in subset}
         subset_assignments = []
         counter = 1
