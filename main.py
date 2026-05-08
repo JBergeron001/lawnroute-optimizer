@@ -248,7 +248,7 @@ def assign_zones_to_crew(zones, crew, mode):
             subset_assignments.append(TaskAssignment(crew_member_id=worker.id, crew_member_name=worker.name, task_order=counter, zone_id='cleanup', zone_label='Final Blowout & Cleanup', task_type='blow', estimated_minutes=blow_mins, role_used='blower', is_role_switch=True))
             subset_load[worker.id] = subset_load.get(worker.id, 0) + blow_mins
             job_duration_hours = max(subset_load.values()) / 60.0
-            total_cost = sum(c.hourly_rate * job_duration_hours for c in subset)
+            total_cost = sum(subset_load.get(c.id, 0) * c.hourly_rate / 60 for c in subset)
             if best_cost is None or total_cost < best_cost:
                 best_cost = total_cost
                 best_assignments = subset_assignments
