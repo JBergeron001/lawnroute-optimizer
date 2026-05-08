@@ -111,27 +111,44 @@ LARGE_FIELD_ACRES = 10.0
 
 # --- Estimators ---
 
-def estimate_mow_minutes(zone: Zone, equipment_type: str, mode: str = "balanced") -> int:
+def estimate_mow_minutes(zone: Zone, equipment_type: str, mode: str = 'balanced') -> int:
     speed_mph = CUTTING_SPEED.get(equipment_type, 4.65)
     deck_ft = DECK_WIDTH.get(equipment_type, 30) / 12
     area_acres = zone.area_sqft / 43560
     efficiency = 0.80
-    if mode == "fastest":
-        efficiency = 0.88
-    elif mode == "cheapest":
+    if mode == 'fastest':
+        efficiency = 0.85
+    elif mode == 'cheapest':
         efficiency = 0.75
     hours = area_acres / (speed_mph * deck_ft * efficiency)
     minutes = max(int(hours * 60), 2)
+    # Slope multiplier
     if zone.slope_grade > 15:
         minutes = int(minutes * 1.5)
     elif zone.slope_grade > 10:
         minutes = int(minutes * 1.25)
-    if zone.zone_type in ["berm", "courtyard"]:
+    # Zone type multiplier
+    if zone.zone_type in ['berm', 'courtyard']:
         minutes = int(minutes * 1.4)
-
+    # Complexity multiplier based on shape irregularity
+    # perimeter^2 / (4 * pi * area) -- circle=1.0, irregular=higher
+    if zone.perimeter_ft and zone.perimeter_ft > 0 and zone.area_sqft > 0:
+        import math as _math
+        shape_score = (zone.perimeter_ft ** 2) / (4 * _math.pi * zone.area_sqft)
+        if shape_score >= 4.0:
+            complexity = 3.0  # extreme - dense buildings, irregular
+        elif shape_score >= 2.5:
+            complexity = 2.3  # complex - many obstacles
+        elif shape_score >= 1.5:
+            complexity = 1.7  # moderate
+        else:
+            complexity = 1.2  # simple open field
+    else:
+        complexity = 2.0  # no perimeter data - assume complex
+    minutes = int(minutes * complexity)
     return max(minutes, 2)
 
-def estimate_trim_minutes(zone: Zone, mode: str = "balanced") -> int:
+def estimate_trim_minutes(zone: Zone, mode: str = 'balanced') -> int:
     if zone.perimeter_ft and zone.perimeter_ft > 0:
         linear_ft = zone.perimeter_ft
     else:
@@ -139,12 +156,10 @@ def estimate_trim_minutes(zone: Zone, mode: str = "balanced") -> int:
     minutes = max(int(linear_ft / TRIMMER_FT_PER_MIN), 2)
     if zone.slope_grade > 10:
         minutes = int(minutes * 1.3)
-
     return max(minutes, 2)
 
 def estimate_blow_minutes(all_zones: List[Zone], mode: str = 'balanced') -> int:
-    # Blow clears boundaries around trim zones - based on perimeter length not area
-    BLOWER_FT_PER_MIN = 325  # blower walks at 3.72 mph along edges
+    BLOWER_FT_PER_MIN = 325
     total_perimeter = 0
     for z in all_zones:
         if z.zone_type in ['trim', 'perimeter', 'mow', 'berm', 'courtyard']:
@@ -154,21 +169,6 @@ def estimate_blow_minutes(all_zones: List[Zone], mode: str = 'balanced') -> int:
                 total_perimeter += 4 * (z.area_sqft ** 0.5)
     minutes = max(int(total_perimeter / BLOWER_FT_PER_MIN), 5)
     return minutes
-
-def get_mowers(crew: list) -> list:
-    mowers = [c for c in crew if c.primary_role in ['zero_turn', 'walk_behind', 'riding_mower']]
-    return sorted(mowers, key=lambda c: c.hourly_rate, reverse=True)
-
-def get_trimmers(crew: list) -> list:
-    return [c for c in crew if c.primary_role == 'trimmer']
-
-def get_foreman(crew: list):
-    foremen = [c for c in crew if c.is_foreman]
-    return foremen[0] if foremen else None
-def classify_zones(zones: list):
-    """
-    Separate zones into:
-    - large_fields: single mow zones above threshold (keep together, one mower)
     - small_mow: smaller mow zones distributed across mowers
     - trim_zones: trim/perimeter zones
     - no_mow: skip
