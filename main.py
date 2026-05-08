@@ -154,11 +154,11 @@ def estimate_trim_minutes(zone: Zone, mode: str = 'balanced') -> int:
     else:
         linear_ft = 5.5 * math.sqrt(zone.area_sqft)
     minutes = max(int(linear_ft / TRIMMER_FT_PER_MIN), 2)
+    minutes = max(int(linear_ft / TRIMMER_FT_PER_MIN), 2)
     if zone.slope_grade > 10:
         minutes = int(minutes * 1.3)
+    minutes = int(minutes * 5.0)
     return max(minutes, 2)
-
-def estimate_blow_minutes(all_zones: List[Zone], mode: str = 'balanced') -> int:
     BLOWER_FT_PER_MIN = 325
     total_perimeter = 0
     for z in all_zones:
