@@ -1,2 +1,2 @@
 [phases.setup]
-nixPkgs = ["postgresql", "libpq"]
+nixPkgs = ["python311", "postgresql", "libpq-dev"]
