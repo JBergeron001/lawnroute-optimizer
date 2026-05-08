@@ -211,8 +211,8 @@ def assign_zones_to_crew(zones, crew, mode):
         leader = get_foreman(crew)
         print(f'CHEAPEST DEBUG: crew={len(crew)}, foreman={leader.name if leader else None}')
         if not leader:
+            leader = max(crew, key=lambda c: c.hourly_rate)
         others = sorted([c for c in crew if c.id != leader.id], key=lambda c: c.hourly_rate)
-        best_cost = None
         best_assignments = None
         for extra in range(0, len(others) + 1):
             subset = [leader] + others[:extra]
