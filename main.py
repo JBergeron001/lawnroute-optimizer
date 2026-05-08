@@ -170,6 +170,39 @@ def estimate_blow_minutes(all_zones: List[Zone], mode: str = 'balanced') -> int:
     minutes = max(int(total_perimeter / BLOWER_FT_PER_MIN), 5)
     return minutes
 
+def get_mowers(crew: list) -> list:
+    mowers = [c for c in crew if c.primary_role in ['zero_turn', 'walk_behind', 'riding_mower']]
+    return sorted(mowers, key=lambda c: c.hourly_rate, reverse=True)
+
+def get_trimmers(crew: list) -> list:
+    return [c for c in crew if c.primary_role == 'trimmer']
+
+def get_foreman(crew: list):
+    foremen = [c for c in crew if c.is_foreman]
+    return foremen[0] if foremen else None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def classify_zones(zones: list):
     workable = [z for z in zones if z.zone_type != 'no_mow']
     mow_zones = [z for z in workable if z.zone_type in ['mow', 'berm', 'island', 'courtyard']]
