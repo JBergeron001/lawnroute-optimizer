@@ -210,9 +210,9 @@ def assign_zones_to_crew(zones, crew, mode):
     # Find optimal crew size by minimizing total labor cost
     # Labor cost = sum(crew_member.hourly_rate * their_time_on_site_hours)
     if mode == "cheapest":
-        # Foreman always required - sort remaining by hourly rate ascending
-        foreman = get_foreman(crew)
-        non_foreman = sorted([c for c in crew if not c.is_foreman], key=lambda c: c.hourly_rate)
+        # Required leader: foreman if assigned, else highest paid crew member
+        foreman = get_foreman(crew) or max(crew, key=lambda c: c.hourly_rate)
+        non_foreman = sorted([c for c in crew if c.id != foreman.id], key=lambda c: c.hourly_rate)
         best_cost = None
         best_assignments = None
         best_crew_subset = None
