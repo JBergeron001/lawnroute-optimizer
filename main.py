@@ -210,16 +210,18 @@ def assign_zones_to_crew(zones, crew, mode):
     # Find optimal crew size by minimizing total labor cost
     # Labor cost = sum(crew_member.hourly_rate * their_time_on_site_hours)
     if mode == "cheapest":
-        # Sort crew by hourly rate ascending (cheapest first)
-        crew_by_cost = sorted(crew, key=lambda c: c.hourly_rate)
-        
+        # Foreman always required - sort remaining by hourly rate ascending
+        foreman = get_foreman(crew)
+        non_foreman = sorted([c for c in crew if not c.is_foreman], key=lambda c: c.hourly_rate)
         best_cost = None
         best_assignments = None
         best_crew_subset = None
-
-        # Try each possible crew size from 1 to full crew
-        for crew_size in range(1, len(crew) + 1):
-            subset = crew_by_cost[:crew_size]
+        # Always include foreman, try adding cheapest workers one at a time
+        for extra in range(0, len(non_foreman) + 1):
+            base = [foreman] if foreman else []
+            subset = base + non_foreman[:extra]
+            if not subset:
+                subset = crew[:1]
             subset_load = {c.id: 0 for c in subset}
             subset_assignments = []
             counter = 1
@@ -598,3 +600,4 @@ def build_graph(request: BuildGraphRequest):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
