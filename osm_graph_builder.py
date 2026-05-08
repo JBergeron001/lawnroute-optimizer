@@ -36,13 +36,17 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def get_db():
+    import ssl
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
     return pg8000.dbapi.connect(
         host=os.getenv("DB_HOST", "localhost"),
         port=int(os.getenv("DB_PORT", 5432)),
         database=os.getenv("DB_NAME", "lawnroute"),
         user=os.getenv("DB_USER", "lawnroute"),
         password=os.getenv("DB_PASSWORD", "lawnroute_dev_2025"),
-        ssl_context=True,
+        ssl_context=ssl_context,
     )
 
 def dict_row(conn, row, description):
