@@ -221,8 +221,28 @@ def assign_zones_to_crew(zones, crew, mode):
             subset_trimmers = [non_foreman[-1]] if non_foreman else [subset[-1]]
             subset_mowers = [c for c in subset_mowers if c not in subset_trimmers] or [subset[0]]
 
+        # --- MOW ZONE SPLITTING ---
+        # If more mowers than zones, split largest zones so all mowers have work
         all_mow = sorted(large_fields + small_mow, key=lambda z: z.area_sqft, reverse=True)
+        expanded_mow = []
         for zone in all_mow:
+            if len(subset_mowers) > len(expanded_mow) + (len(all_mow) - all_mow.index(zone) - 1):
+                # Split this zone across remaining idle mowers
+                idle_mowers = len(subset_mowers) - len(expanded_mow)
+                if idle_mowers > 1:
+                    section_sqft = zone.area_sqft / idle_mowers
+                    for i in range(idle_mowers):
+                        from copy import copy
+                        z_copy = copy(zone)
+                        z_copy.area_sqft = section_sqft
+                        z_copy.label = f'{zone.label} (Section {i+1})'
+                        expanded_mow.append(z_copy)
+                else:
+                    expanded_mow.append(zone)
+            else:
+                expanded_mow.append(zone)
+
+        for zone in expanded_mow:
             worker = min(subset_mowers, key=lambda c: subset_load.get(c.id, 0))
             eq = worker.primary_role if worker.primary_role in CUTTING_SPEED else 'walk_behind'
             mins = estimate_mow_minutes(zone, eq, mode)
@@ -234,7 +254,27 @@ def assign_zones_to_crew(zones, crew, mode):
             subset_load[worker.id] = subset_load.get(worker.id, 0) + mins
             counter += 1
 
-        for zone in sorted(trim_zones, key=lambda z: estimate_trim_minutes(z, mode), reverse=True):
+        # --- TRIM ZONE SPLITTING ---
+        # If more trimmers than zones, split largest trim zones
+        all_trim = sorted(trim_zones, key=lambda z: estimate_trim_minutes(z, mode), reverse=True)
+        expanded_trim = []
+        for zone in all_trim:
+            if len(subset_trimmers) > len(expanded_trim) + (len(all_trim) - all_trim.index(zone) - 1):
+                idle_trimmers = len(subset_trimmers) - len(expanded_trim)
+                if idle_trimmers > 1:
+                    section_sqft = zone.area_sqft / idle_trimmers
+                    for i in range(idle_trimmers):
+                        from copy import copy
+                        z_copy = copy(zone)
+                        z_copy.area_sqft = section_sqft
+                        z_copy.label = f'{zone.label} (Section {i+1})'
+                        expanded_trim.append(z_copy)
+                else:
+                    expanded_trim.append(zone)
+            else:
+                expanded_trim.append(zone)
+
+        for zone in expanded_trim:
             worker = min(subset_trimmers, key=lambda c: subset_load.get(c.id, 0))
             prev = [a for a in subset_assignments if a.crew_member_id == worker.id]
             is_switch = bool(prev) and prev[-1].task_type == 'mow'
@@ -247,19 +287,28 @@ def assign_zones_to_crew(zones, crew, mode):
             subset_load[worker.id] = subset_load.get(worker.id, 0) + mins
             counter += 1
 
-        blow_mins = estimate_blow_minutes(zones, mode) + TASK_SWITCH_PENALTY_MINUTES
-        blow_worker = min(subset, key=lambda c: subset_load.get(c.id, 0))
+        # --- BLOW TRIGGERING ---
+        # Blow starts when mow+trim is 85% complete
+        # Whoever finishes mow/trim first picks up the blower
+        mow_trim_time = max(subset_load.values()) if subset_load else 0
+        blow_start = mow_trim_time * 0.85
+        blow_mins = estimate_blow_minutes(zones, mode)
+        # Find who finishes mow+trim first
+        mow_trim_workers = subset_mowers + [t for t in subset_trimmers if t not in subset_mowers]
+        blow_worker = min(mow_trim_workers, key=lambda c: subset_load.get(c.id, 0))
+        # Blow time = remaining blow after mow+trim overlap
+        overlap = max(0, mow_trim_time - blow_start)
+        effective_blow = max(blow_mins - overlap, 5)
         subset_assignments.append(TaskAssignment(
             crew_member_id=blow_worker.id, crew_member_name=blow_worker.name,
             task_order=counter, zone_id='cleanup', zone_label='Final Blowout & Cleanup',
-            task_type='blow', estimated_minutes=blow_mins, role_used='blower', is_role_switch=True
+            task_type='blow', estimated_minutes=int(effective_blow), role_used='blower', is_role_switch=True
         ))
-        subset_load[blow_worker.id] = subset_load.get(blow_worker.id, 0) + blow_mins
+        subset_load[blow_worker.id] = subset_load.get(blow_worker.id, 0) + effective_blow
 
         job_time = max(subset_load.values())
         wage_cost = sum(subset_load.get(c.id, 0) * c.hourly_rate / 60 for c in subset)
         return subset_assignments, job_time, wage_cost
-
     if mode == 'cheapest':
         # Start with 2 crew, add more only if wage bill goes DOWN
         best_assignments, best_time, best_cost = run_subset(ordered_crew[:2], mode)
