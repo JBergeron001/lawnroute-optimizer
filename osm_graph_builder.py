@@ -463,7 +463,7 @@ def detect_tight_spaces(edges: list) -> list:
 
     for i, edge in enumerate(edges):
         geom_a = edge.get("geometry")
-        if not geom_a or edge["task_type"] == "none":
+        if not geom_a or edge["task_type"] != "mow":
             tight_flagged.append(edge)
             continue
 
@@ -474,7 +474,7 @@ def detect_tight_spaces(edges: list) -> list:
             if i == j:
                 continue
             geom_b = other.get("geometry")
-            if not geom_b or other["task_type"] == "none":
+            if not geom_b or other["task_type"] != "none":
                 continue
             try:
                 dist_m = geom_a.distance(geom_b) * 111320
@@ -488,8 +488,6 @@ def detect_tight_spaces(edges: list) -> list:
         if min_clearance is not None:
             updated["measured_corridor_width_m"] = round(min_clearance, 3)
             updated["constraining_feature"] = constraining_feature
-
-            if min_clearance < TRIMMER_WIDTH:
                 updated["equipment_constraint"] = "inaccessible"
                 updated["tight_space_flag"] = True
                 updated["tight_space_reason"] = f"Corridor {min_clearance:.2f}m - inaccessible"
