@@ -136,15 +136,15 @@ def estimate_mow_minutes(zone: Zone, equipment_type: str, mode: str = 'balanced'
         import math as _math
         shape_score = (zone.perimeter_ft ** 2) / (4 * _math.pi * zone.area_sqft)
         if shape_score >= 4.0:
-            complexity = 5.0
+            complexity = 6.0
         elif shape_score >= 2.5:
-            complexity = 3.5
+            complexity = 4.0
         elif shape_score >= 1.5:
-            complexity = 2.0
+            complexity = 2.5
         else:
-            complexity = 1.0
+            complexity = 1.2
     else:
-        complexity = 5.0  # no perimeter data - assume extreme complexity
+        complexity = 6.0  # no perimeter data - assume complex site
     minutes = int(minutes * complexity)
     return max(minutes, 2)
 
