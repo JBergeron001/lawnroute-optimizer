@@ -273,7 +273,7 @@ def assign_zones_to_crew(zones, crew, mode):
                 best_assignments = assignments
                 best_time = job_time
             else:
-                if wage_cost > best_cost * 1.01: break  # cost went up more than 1%, stop
+                break
         print(f'CHEAPEST final cost=')
         return best_assignments
 
