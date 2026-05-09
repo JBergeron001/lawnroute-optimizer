@@ -142,12 +142,12 @@ def estimate_trim_minutes(zone: Zone, mode: str = "balanced") -> int:
     minutes = int(minutes * MODE_SPEED_MULTIPLIER.get(mode, 1.0))
     return max(minutes, 2)
 
-def estimate_blow_minutes(all_zones: List[Zone], mode: str = "balanced") -> int:
-    total_sqft = sum(z.area_sqft for z in all_zones if z.zone_type != "no_mow")
-    total_acres = total_sqft / 43560
-    minutes = max(int(total_acres * 12), 10)
-    minutes = int(minutes * MODE_SPEED_MULTIPLIER.get(mode, 1.0))
-    return max(minutes, 5)
+def estimate_blow_minutes(all_zones: List[Zone], mode: str = 'balanced') -> int:
+    workable = [z for z in all_zones if z.zone_type != 'no_mow']
+    zone_count = len(workable)
+    minutes = max(10 + (zone_count * 3), 15)
+    return max(minutes, 10)
+
 
 # --- Role classification helpers ---
 
