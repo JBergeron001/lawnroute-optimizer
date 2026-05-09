@@ -261,20 +261,20 @@ def assign_zones_to_crew(zones, crew, mode):
         return subset_assignments, job_time, wage_cost
 
     if mode == 'cheapest':
-        # Start with 2 crew, add more only if wage bill goes DOWN
-        best_assignments, best_time, best_cost = run_subset(ordered_crew[:2], mode)
-        print(f'CHEAPEST size=2 cost={best_cost:.2f}')
-        for size in range(3, len(ordered_crew) + 1):
-            subset = ordered_crew[:size]
-            assignments, job_time, wage_cost = run_subset(subset, mode)
-            print(f'CHEAPEST size={size} cost={wage_cost:.2f}')
-            if wage_cost < best_cost:
-                best_cost = wage_cost
-                best_assignments = assignments
-                best_time = job_time
-            else:
-                break
-        print(f'CHEAPEST final cost=')
+        # Lean Crew - always use minimum 2 crew
+        assignments, job_time, wage_cost = run_subset(ordered_crew[:2], mode)
+        print(f'LEAN CREW size=2 time={job_time:.0f} cost={wage_cost:.2f}')
+        return assignments
+
+
+
+
+
+
+
+
+
+
         return best_assignments
 
     elif mode == 'fastest':
