@@ -19,17 +19,14 @@ Time estimation philosophy:
 
 Three optimization modes — each is an independent scenario:
   Lean Crew  : Always exactly 2 crew. Shows minimum labor cost option.
-  Optimal    : Algorithm finds the crew size where adding one more person
-               stops saving meaningful time (< 12% improvement).
+  Optimal    : Acreage-based crew floor + algorithm finds sweet spot
+               where adding one more person stops saving meaningful time.
                This is the recommended staffing level for the property.
   Max Speed  : Optimal crew size + 2 extra. Aggressive but realistic.
-               Useful when weather is coming or job needs early finish.
                Capped at total available crew.
 
 The pre-assigned crew task breakdown is calculated separately and
-returned alongside the 3 scenarios so the owner can see both:
-  (a) what staffing options look like
-  (b) exactly what their assigned crew will do
+returned alongside the 3 scenarios.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -85,9 +82,9 @@ class Equipment(BaseModel):
 class OptimizeRequest(BaseModel):
     job_id: str
     zones: List[Zone]
-    crew: List[CrewMember]           # pre-assigned crew for this job
+    crew: List[CrewMember]
     equipment: List[Equipment]
-    available_crew: Optional[List[CrewMember]] = None  # all company crew for scenarios
+    available_crew: Optional[List[CrewMember]] = None
 
 class TaskAssignment(BaseModel):
     crew_member_id: str
@@ -103,7 +100,7 @@ class TaskAssignment(BaseModel):
 class ScenarioResult(BaseModel):
     crew_size: int
     total_minutes: int
-    wage_cost: float          # labor cost in dollars — shown to manager/owner only
+    wage_cost: float
     crew_assignments: List[TaskAssignment]
 
 class OptimizeResponse(BaseModel):
@@ -111,7 +108,7 @@ class OptimizeResponse(BaseModel):
     lean: ScenarioResult
     optimal: ScenarioResult
     max_speed: ScenarioResult
-    assigned: ScenarioResult   # pre-assigned crew breakdown
+    assigned: ScenarioResult
     solve_time_ms: int
     blow_note: str
 
@@ -148,8 +145,6 @@ TASK_SWITCH_PENALTY_MINUTES = 8
 MIN_CREW_SIZE = 2
 LARGE_FIELD_ACRES = 10.0
 
-# Mode multipliers — affect time estimates only
-# These are applied within each scenario's run_subset call
 MODE_SPEED_MULTIPLIER = {
     "fastest":  0.88,
     "balanced": 1.0,
@@ -161,6 +156,38 @@ BASE_EFFICIENCY = {
     "balanced": 0.60,
     "cheapest": 0.54,
 }
+
+# ─── Acreage-Based Crew Floor ─────────────────────────────────────────────────
+# Minimum crew size for Optimal scenario based on total mowable acreage.
+# No experienced owner sends 2 people to a 40-acre HOA.
+# These floors represent real-world minimum sensible staffing.
+#
+#  < 1 acre   → 2 crew  (typical single residential)
+#  1-3 acres  → 2 crew  (large residential, small commercial)
+#  3-8 acres  → 3 crew  (medium commercial, small HOA)
+#  8-20 acres → 4 crew  (large commercial, medium HOA)
+# 20-40 acres → 5 crew  (large HOA, municipal)
+# > 40 acres  → 6 crew  (very large HOA, campus)
+
+def get_optimal_crew_floor(zones: List[Zone]) -> int:
+    mow_zones = [z for z in zones if z.zone_type in [
+        "mow", "berm", "island", "courtyard", "slope"
+    ]]
+    total_sqft = sum(z.area_sqft for z in mow_zones)
+    acres = total_sqft / 43560.0
+
+    if acres < 1.0:
+        return 2
+    elif acres < 3.0:
+        return 2
+    elif acres < 8.0:
+        return 3
+    elif acres < 20.0:
+        return 4
+    elif acres < 40.0:
+        return 5
+    else:
+        return 6
 
 # ─── Turn Penalty ─────────────────────────────────────────────────────────────
 
@@ -323,7 +350,6 @@ def get_trimmers(crew: List[CrewMember]) -> List[CrewMember]:
     return [c for c in crew if c.primary_role == "trimmer"]
 
 def order_crew(crew: List[CrewMember]) -> List[CrewMember]:
-    """Order crew: foreman first, then by hourly rate descending."""
     foreman = get_foreman(crew)
     if foreman:
         others = sorted(
@@ -366,12 +392,6 @@ def run_subset(
     all_zones: List[Zone],
     mode: str
 ) -> tuple:
-    """
-    Distribute all zones across the given crew subset.
-    Every crew member gets tasks — roles assigned by workload, not hardcoded.
-    On large sites with 2 crew, both may mow; first finished trims/blows.
-    Returns (assignments, job_time_minutes, wage_cost_dollars).
-    """
     subset_load = {c.id: 0.0 for c in subset}
     assignments = []
     counter = 1
@@ -381,12 +401,9 @@ def run_subset(
     ]]
     subset_trimmers = [c for c in subset if c.primary_role == "trimmer"]
 
-    # If no explicit mowers, highest-paid crew member mows
     if not subset_mowers:
         subset_mowers = [max(subset, key=lambda c: c.hourly_rate)]
 
-    # If no explicit trimmers, lowest-paid non-foreman non-mower trims
-    # On small crews (2 people) both may mow and first finished trims
     if not subset_trimmers:
         non_foreman = [c for c in subset if not c.is_foreman and c not in subset_mowers]
         if non_foreman:
@@ -395,10 +412,8 @@ def run_subset(
             if not subset_mowers:
                 subset_mowers = [subset[0]]
         else:
-            # All crew mow — whoever finishes first will get trim assigned by load balancer
             subset_trimmers = subset_mowers[-1:]
 
-    # Assign mow zones divided into sections across mowers
     all_mow = sorted(large_fields + small_mow, key=lambda z: z.area_sqft, reverse=True)
     sections = divide_into_sections(all_mow, len(subset))
 
@@ -422,7 +437,6 @@ def run_subset(
                 subset_load[worker.id] = subset_load.get(worker.id, 0) + mins
                 counter += 1
 
-    # Assign trim zones — load balanced across trimmers
     for zone in sorted(trim_zones, key=lambda z: estimate_trim_minutes(z, mode), reverse=True):
         worker = min(subset_trimmers, key=lambda c: subset_load.get(c.id, 0))
         prev = [a for a in assignments if a.crew_member_id == worker.id]
@@ -444,7 +458,6 @@ def run_subset(
         subset_load[worker.id] = subset_load.get(worker.id, 0) + mins
         counter += 1
 
-    # Blow/cleanup — whoever has lightest load after mow+trim
     blow_mins = estimate_blow_minutes(all_zones, mode) + TASK_SWITCH_PENALTY_MINUTES
     blow_worker = min(subset, key=lambda c: subset_load.get(c.id, 0))
     assignments.append(TaskAssignment(
@@ -460,10 +473,7 @@ def run_subset(
     ))
     subset_load[blow_worker.id] = subset_load.get(blow_worker.id, 0) + blow_mins
 
-    # Job time = longest individual crew member's total time (parallel work)
     job_time = max(subset_load.values()) if subset_load else 0
-
-    # Wage cost = sum of each crew member's time × their hourly rate
     wage_cost = sum(
         subset_load.get(c.id, 0) * c.hourly_rate / 60.0
         for c in subset
@@ -478,7 +488,6 @@ def scenario_lean(
 ) -> ScenarioResult:
     """
     Lean Crew: Always exactly 2 crew.
-    Uses the 2 best-suited crew members from available pool.
     Both may mow on large sites — first finished trims/blows.
     Time multiplier: cheapest (1.18x) — smaller crew, slower pace.
     """
@@ -502,27 +511,41 @@ def scenario_optimal(
     available_crew: List[CrewMember]
 ) -> ScenarioResult:
     """
-    Optimal Crew: Algorithm finds the crew size where adding one more
-    person stops saving meaningful time (< 12% improvement).
-    Uses balanced time multiplier (1.0x).
+    Optimal Crew: Acreage-based floor + 12% improvement algorithm.
 
-    Algorithm:
-      1. Start at 2 crew, record job time
-      2. Add one crew member, re-run
-      3. If new time < previous time * 0.88 (>12% faster), keep going
-      4. Otherwise stop — previous size was optimal
-      5. Cap at min(available crew, 10)
+    Step 1 — Calculate minimum crew floor from total mowable acreage:
+      < 1 acre   → 2 crew
+      1-3 acres  → 2 crew
+      3-8 acres  → 3 crew
+      8-20 acres → 4 crew
+      20-40 acres → 5 crew
+      > 40 acres → 6 crew
+
+    Step 2 — Start at the floor, add one crew member at a time.
+      Stop when adding one more person saves less than 12% time.
+      Cap at min(available crew, 10).
+
+    Uses balanced time multiplier (1.0x).
     """
     large_fields, small_mow, trim_zones, _ = classify_zones(zones)
     ordered = order_crew(available_crew)
     max_crew = min(len(ordered), 10)
 
-    best_size = 2
-    best_assignments, best_time, best_cost = run_subset(
-        ordered[:2], large_fields, small_mow, trim_zones, zones, "balanced"
-    )
+    # Step 1 — acreage floor
+    floor = get_optimal_crew_floor(zones)
+    floor = min(floor, max_crew)
 
-    for size in range(3, max_crew + 1):
+    print(f"OPTIMAL floor={floor} max={max_crew}")
+
+    # Step 2 — start at floor
+    best_assignments, best_time, best_cost = run_subset(
+        ordered[:floor], large_fields, small_mow, trim_zones, zones, "balanced"
+    )
+    best_size = floor
+    print(f"OPTIMAL size={floor} time={best_time:.0f}min")
+
+    # Iterate upward from floor
+    for size in range(floor + 1, max_crew + 1):
         subset = ordered[:size]
         assignments, job_time, wage_cost = run_subset(
             subset, large_fields, small_mow, trim_zones, zones, "balanced"
@@ -531,13 +554,11 @@ def scenario_optimal(
         print(f"OPTIMAL size={size} time={job_time:.0f}min improvement={improvement:.1%}")
 
         if improvement >= 0.12:
-            # Meaningful improvement — this size is better
             best_size = size
             best_time = job_time
             best_cost = wage_cost
             best_assignments = assignments
         else:
-            # Adding this person didn't help enough — stop here
             break
 
     print(f"OPTIMAL final: {best_size} crew, {best_time:.0f}min, ${best_cost:.2f}")
@@ -556,7 +577,6 @@ def scenario_max_speed(
 ) -> ScenarioResult:
     """
     Max Speed: Optimal crew size + 2 extra.
-    Aggressive but realistic — not "throw everyone at it".
     Uses fastest time multiplier (0.88x).
     Capped at total available crew.
     """
@@ -582,9 +602,8 @@ def scenario_assigned(
     assigned_crew: List[CrewMember]
 ) -> ScenarioResult:
     """
-    Assigned Crew: Runs assignment for exactly the crew the owner
-    pre-assigned to this job. Uses balanced multiplier.
-    This is what gets saved to job_tasks in the DB.
+    Assigned Crew: Runs assignment for exactly the pre-assigned crew.
+    Uses balanced multiplier. Saved to job_tasks in the DB.
     """
     large_fields, small_mow, trim_zones, _ = classify_zones(zones)
     ordered = order_crew(assigned_crew)
@@ -615,8 +634,6 @@ def optimize(request: OptimizeRequest):
     if not request.crew:
         raise HTTPException(status_code=400, detail="No crew provided")
 
-    # All company crew for scenario calculations
-    # Merge available_crew, deduplicated, assigned crew first
     assigned_ids = {c.id for c in request.crew}
     extra_crew = [c for c in (request.available_crew or []) if c.id not in assigned_ids]
     all_crew = list(request.crew) + extra_crew
@@ -625,19 +642,16 @@ def optimize(request: OptimizeRequest):
     fill_hourly_rates(list(request.crew))
 
     try:
-        # Run all 3 scenarios + assigned breakdown
         lean_result = scenario_lean(request.zones, all_crew)
         optimal_result = scenario_optimal(request.zones, all_crew)
         max_result = scenario_max_speed(request.zones, all_crew, optimal_result.crew_size)
         assigned_result = scenario_assigned(request.zones, list(request.crew))
-
     except Exception as e:
         import traceback
         print(f"OPTIMIZER ERROR: {e}")
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Optimizer error: {str(e)}")
 
-    # Blow note for display
     blow_zones = [z for z in request.zones if z.zone_type in ["perimeter", "trim"]]
     has_real_footage = any(z.linear_ft or z.perimeter_ft for z in blow_zones)
     if has_real_footage:
