@@ -1,32 +1,44 @@
 """
 LawnRoute Task Optimizer — main.py
 
-Time estimation philosophy:
-  - Mowing speed is NOT the theoretical max speed of the machine.
-    It is the real-world effective speed accounting for:
-      • Turns at end of each row (180° turn + deceleration + acceleration)
-      • Boundary passes (first mow the perimeter, then strip the interior)
-      • Row overlap (6-12 inches between passes to avoid missed strips)
-      • Gate entries, repositioning around obstacles
-      • Equipment efficiency losses (engine load, terrain variation)
-    These factors reduce effective speed to ~55-65% of theoretical max.
+Calibration basis:
+  Meadowbrook CC Estates — 11 acres, complex layout, 5 crew, 6-7 hours real time.
+  Effective mow rate: ~0.46 acres/person/hour on a complex site.
 
-  - The complexity_factor on each zone is the primary mechanism for
-    capturing site-specific difficulty.
+Deck widths:
+  60 inch (5.0 ft) zero-turn — open mow zones >= 0.5 acres
+  36 inch (3.0 ft) walk-behind — complex zones (berm, courtyard, island, slope)
+                                  and small mow zones < 0.5 acres
 
-  - Property type complexity is handled HERE in the optimizer, not in
-    the API layer. The API sends raw area_sqft — no pre-multiplication.
+Fixed overhead per job:
+  Setup/arrival:   7 minutes (unload, walkthrough, prep)
+  End walkthrough: 7 minutes (foreman quality check before leaving)
+  Zone transition: 2.5 minutes per zone change (mower repositioning)
 
-Three optimization modes — each is an independent scenario:
-  Lean Crew  : Always exactly 2 crew. Shows minimum labor cost option.
-  Optimal    : Acreage-based crew floor + algorithm finds sweet spot
-               where adding one more person stops saving meaningful time.
-               This is the recommended staffing level for the property.
-  Max Speed  : Optimal crew size + 2 extra. Aggressive but realistic.
-               Capped at total available crew.
+Crew assignment model:
 
-The pre-assigned crew task breakdown is calculated separately and
-returned alongside the 3 scenarios.
+  Crew of 2:
+    Both mow simultaneously.
+    First to finish mowing trims all trim zones.
+    Second to finish mowing blows.
+    Job time = when last task finishes.
+
+  Crew of 3+:
+    Trimmer count based on workload — NOT acreage:
+      Estimate total trim time for 1 person.
+      Estimate mow time for remaining crew.
+      If 1 trimmer finishes before mowers → 1 trimmer (they blow after).
+      If trim time > mow time → 2 trimmers to avoid trim being the bottleneck.
+      Never more than 2 trimmers regardless of site size.
+    Trimmer(s) are cheapest worker(s). Ties broken by first in list only.
+    Trimmer never mows. Mowers never trim.
+    Mowing and trimming run in parallel.
+    Whoever finishes their primary task first picks up the blower.
+    Job time = max(slowest mower, trimmer finish time) + blow time for finisher.
+
+  Travel between zones:
+    2.5 minutes added per zone transition for each mower.
+    Phase 2: replace with actual PostGIS distances between zone centroids.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -112,99 +124,74 @@ class OptimizeResponse(BaseModel):
     solve_time_ms: int
     blow_note: str
 
-# ─── Speed Constants ──────────────────────────────────────────────────────────
+# ─── Constants ────────────────────────────────────────────────────────────────
 
-CUTTING_SPEED_MPH = {
-    "zero_turn":    3.5,
-    "riding_mower": 3.2,
-    "walk_behind":  2.5,
-    "trimmer":      2.8,
-    "blower":       3.2,
-    "edger":        2.5,
-}
+MOW_SPEED_MPH   = 4.5
+DECK_FT_OPEN    = 5.0    # 60 inch zero-turn
+DECK_FT_COMPLEX = 3.0    # 36 inch walk-behind
 
-DECK_WIDTH_INCHES = {
-    "zero_turn":    60,
-    "riding_mower": 54,
-    "walk_behind":  30,
-    "trimmer":      1,
-    "blower":       1,
-    "edger":        1,
-}
+COMPLEX_ZONE_TYPES = {"berm", "courtyard", "island", "slope"}
 
-TRIMMER_FT_PER_MIN = 150.0
+# Fixed overhead added to every job
+JOB_SETUP_MINUTES      = 7    # arrival, unload, walkthrough
+JOB_WALKTHROUGH_MINUTES = 7   # foreman end-of-job quality check
+ZONE_TRAVEL_MINUTES    = 2.5  # repositioning between zones per mower
+TASK_SWITCH_PENALTY    = 6    # tool swap time
 
-BLOWER_FT_PER_MIN = {
-    "pavement":   200.0,
-    "beds":       100.0,
-    "mixed":      150.0,
-    None:         150.0,
-}
-
-TASK_SWITCH_PENALTY_MINUTES = 8
 MIN_CREW_SIZE = 2
 LARGE_FIELD_ACRES = 10.0
 
-MODE_SPEED_MULTIPLIER = {
-    "fastest":  0.88,
-    "balanced": 1.0,
-    "cheapest": 1.18,
+BASE_EFFICIENCY = {
+    "fastest":  0.42,
+    "balanced": 0.35,   # calibrated from Meadowbrook ground truth
+    "cheapest": 0.30,
 }
 
-BASE_EFFICIENCY = {
-    "fastest":  0.68,
-    "balanced": 0.60,
-    "cheapest": 0.54,
+MODE_SPEED_MULTIPLIER = {
+    "fastest":  0.90,
+    "balanced": 1.00,
+    "cheapest": 1.15,
 }
+
+TRIMMER_FT_PER_MIN = 130.0
+BLOWER_FT_PER_MIN  = 140.0
+
+# ─── Deck Width ───────────────────────────────────────────────────────────────
+
+def get_deck_ft(zone: Zone) -> float:
+    if zone.zone_type in COMPLEX_ZONE_TYPES:
+        return DECK_FT_COMPLEX
+    if zone.zone_type == "mow" and zone.area_sqft < (0.5 * 43560):
+        return DECK_FT_COMPLEX
+    return DECK_FT_OPEN
 
 # ─── Acreage-Based Crew Floor ─────────────────────────────────────────────────
-# Minimum crew size for Optimal scenario based on total mowable acreage.
-# No experienced owner sends 2 people to a 40-acre HOA.
-# These floors represent real-world minimum sensible staffing.
-#
-#  < 1 acre   → 2 crew  (typical single residential)
-#  1-3 acres  → 2 crew  (large residential, small commercial)
-#  3-8 acres  → 3 crew  (medium commercial, small HOA)
-#  8-20 acres → 4 crew  (large commercial, medium HOA)
-# 20-40 acres → 5 crew  (large HOA, municipal)
-# > 40 acres  → 6 crew  (very large HOA, campus)
 
 def get_optimal_crew_floor(zones: List[Zone]) -> int:
     mow_zones = [z for z in zones if z.zone_type in [
         "mow", "berm", "island", "courtyard", "slope"
     ]]
-    total_sqft = sum(z.area_sqft for z in mow_zones)
-    acres = total_sqft / 43560.0
-
-    if acres < 1.0:
-        return 2
-    elif acres < 3.0:
-        return 2
-    elif acres < 8.0:
-        return 3
-    elif acres < 20.0:
-        return 4
-    elif acres < 40.0:
-        return 5
-    else:
-        return 6
+    acres = sum(z.area_sqft for z in mow_zones) / 43560.0
+    if acres < 1.0:    return 2
+    elif acres < 3.0:  return 2
+    elif acres < 8.0:  return 3
+    elif acres < 20.0: return 4
+    elif acres < 40.0: return 5
+    else:              return 6
 
 # ─── Turn Penalty ─────────────────────────────────────────────────────────────
 
 def get_turn_penalty(area_sqft: float) -> float:
     acres = area_sqft / 43560.0
-    if acres < 0.5:
-        return 1.35
-    elif acres < 2.0:
-        return 1.20
-    elif acres < 5.0:
-        return 1.12
-    elif acres < 15.0:
-        return 1.06
-    else:
-        return 1.03
+    if acres < 0.25:   return 1.55
+    elif acres < 0.5:  return 1.40
+    elif acres < 1.0:  return 1.28
+    elif acres < 2.0:  return 1.18
+    elif acres < 5.0:  return 1.10
+    elif acres < 15.0: return 1.05
+    else:              return 1.02
 
-# ─── Measurement Waterfall ────────────────────────────────────────────────────
+# ─── Measurement Helpers ──────────────────────────────────────────────────────
 
 def get_trim_linear_ft(zone: Zone) -> float:
     if zone.linear_ft and zone.linear_ft > 0:
@@ -227,37 +214,30 @@ def get_zone_complexity(zone: Zone) -> float:
 
 # ─── Time Estimators ──────────────────────────────────────────────────────────
 
-def estimate_mow_minutes(zone: Zone, equipment_type: str, mode: str = "balanced") -> int:
+def estimate_mow_minutes(zone: Zone, mode: str = "balanced") -> int:
+    # Real historical data overrides calculation — self-learning
     if zone.avg_actual_mow_minutes and zone.avg_actual_mow_minutes > 0:
         return max(int(zone.avg_actual_mow_minutes * MODE_SPEED_MULTIPLIER.get(mode, 1.0)), 2)
 
-    speed_mph = CUTTING_SPEED_MPH.get(equipment_type, 3.5)
-    deck_ft = DECK_WIDTH_INCHES.get(equipment_type, 30) / 12.0
-    efficiency = BASE_EFFICIENCY.get(mode, 0.60)
-
+    deck_ft = get_deck_ft(zone)
+    efficiency = BASE_EFFICIENCY.get(mode, 0.35)
     area_acres = zone.area_sqft / 43560.0
-    hours = area_acres / (speed_mph * deck_ft * efficiency)
+    hours = area_acres / (MOW_SPEED_MPH * deck_ft * efficiency)
     minutes = max(int(hours * 60), 2)
 
     minutes = int(minutes * get_turn_penalty(zone.area_sqft))
 
-    if zone.slope_grade > 15:
-        minutes = int(minutes * 1.6)
-    elif zone.slope_grade > 10:
-        minutes = int(minutes * 1.35)
-    elif zone.slope_grade > 5:
-        minutes = int(minutes * 1.15)
+    if zone.slope_grade > 15:   minutes = int(minutes * 1.7)
+    elif zone.slope_grade > 10: minutes = int(minutes * 1.4)
+    elif zone.slope_grade > 5:  minutes = int(minutes * 1.18)
 
-    if zone.zone_type in ["berm", "courtyard"]:
-        minutes = int(minutes * 1.5)
-    elif zone.zone_type == "island":
-        minutes = int(minutes * 1.3)
-    elif zone.zone_type == "slope":
-        minutes = int(minutes * 1.4)
+    if zone.zone_type == "berm":        minutes = int(minutes * 1.55)
+    elif zone.zone_type == "courtyard": minutes = int(minutes * 1.50)
+    elif zone.zone_type == "island":    minutes = int(minutes * 1.35)
+    elif zone.zone_type == "slope":     minutes = int(minutes * 1.45)
 
     minutes = int(minutes * get_zone_complexity(zone))
     minutes = int(minutes * MODE_SPEED_MULTIPLIER.get(mode, 1.0))
-
     return max(minutes, 2)
 
 
@@ -268,118 +248,114 @@ def estimate_trim_minutes(zone: Zone, mode: str = "balanced") -> int:
     linear_ft = get_trim_linear_ft(zone)
     minutes = max(int(linear_ft / TRIMMER_FT_PER_MIN), 2)
 
-    if zone.slope_grade > 10:
-        minutes = int(minutes * 1.3)
-    elif zone.slope_grade > 5:
-        minutes = int(minutes * 1.15)
+    if zone.slope_grade > 10:  minutes = int(minutes * 1.3)
+    elif zone.slope_grade > 5: minutes = int(minutes * 1.15)
 
     minutes = int(minutes * get_zone_complexity(zone))
     minutes = int(minutes * MODE_SPEED_MULTIPLIER.get(mode, 1.0))
-
     return max(minutes, 2)
 
 
 def estimate_blow_minutes(all_zones: List[Zone], mode: str = "balanced") -> int:
-    blowable_zones = [z for z in all_zones if z.zone_type not in ["no_mow"]]
-
-    actual_blow = next(
-        (z.avg_actual_blow_minutes for z in blowable_zones
+    blowable = [z for z in all_zones if z.zone_type != "no_mow"]
+    actual = next(
+        (z.avg_actual_blow_minutes for z in blowable
          if z.avg_actual_blow_minutes and z.avg_actual_blow_minutes > 0),
         None
     )
-    if actual_blow:
-        return max(int(actual_blow * MODE_SPEED_MULTIPLIER.get(mode, 1.0)), 10)
-
-    total_blow_ft = 0.0
-    has_real_footage = False
-
-    for zone in blowable_zones:
-        if zone.zone_type in ["perimeter", "trim"]:
-            ft = get_blow_linear_ft(zone)
-            if zone.linear_ft or zone.perimeter_ft:
-                has_real_footage = True
-            total_blow_ft += ft
-
-    if has_real_footage and total_blow_ft > 0:
-        blow_rate = BLOWER_FT_PER_MIN[None]
-        surface_types = [z.surface_type for z in blowable_zones if z.surface_type]
-        if surface_types:
-            pavement_count = sum(1 for s in surface_types if s == "pavement")
-            beds_count = sum(1 for s in surface_types if s == "beds")
-            if pavement_count > beds_count:
-                blow_rate = BLOWER_FT_PER_MIN["pavement"]
-            elif beds_count > pavement_count:
-                blow_rate = BLOWER_FT_PER_MIN["beds"]
-        minutes = max(int(total_blow_ft / blow_rate), 10)
-    else:
-        zone_count = len(blowable_zones)
-        minutes = max(10 + (zone_count * 5), 15)
-
-    minutes = int(minutes * MODE_SPEED_MULTIPLIER.get(mode, 1.0))
-    return max(minutes, 10)
+    if actual:
+        return max(int(actual * MODE_SPEED_MULTIPLIER.get(mode, 1.0)), 10)
+    total_ft = sum(get_blow_linear_ft(z) for z in blowable)
+    minutes = max(int(total_ft / BLOWER_FT_PER_MIN), 10)
+    return max(int(minutes * MODE_SPEED_MULTIPLIER.get(mode, 1.0)), 10)
 
 # ─── Zone Classification ──────────────────────────────────────────────────────
 
 def classify_zones(zones: List[Zone]):
-    workable = [z for z in zones if z.zone_type != "no_mow"]
-    mow_zones = [z for z in workable if z.zone_type in [
+    workable   = [z for z in zones if z.zone_type != "no_mow"]
+    mow_zones  = [z for z in workable if z.zone_type in [
         "mow", "berm", "island", "courtyard", "slope"
     ]]
     trim_zones = [z for z in workable if z.zone_type in ["trim", "perimeter"]]
     large_fields = [
         z for z in mow_zones
-        if z.area_sqft >= (LARGE_FIELD_ACRES * 43560)
-        and not z.equipment_restriction
+        if z.area_sqft >= (LARGE_FIELD_ACRES * 43560) and not z.equipment_restriction
     ]
     small_mow = [z for z in mow_zones if z not in large_fields]
     return large_fields, small_mow, trim_zones, workable
 
 # ─── Crew Helpers ─────────────────────────────────────────────────────────────
 
-def get_foreman(crew: List[CrewMember]) -> Optional[CrewMember]:
-    foremen = [c for c in crew if c.is_foreman]
-    return foremen[0] if foremen else None
-
-def get_mowers(crew: List[CrewMember]) -> List[CrewMember]:
-    return sorted(
-        [c for c in crew if c.primary_role in ["zero_turn", "walk_behind", "riding_mower"]],
-        key=lambda c: c.hourly_rate, reverse=True
-    )
-
-def get_trimmers(crew: List[CrewMember]) -> List[CrewMember]:
-    return [c for c in crew if c.primary_role == "trimmer"]
-
-def order_crew(crew: List[CrewMember]) -> List[CrewMember]:
-    foreman = get_foreman(crew)
-    if foreman:
-        others = sorted(
-            [c for c in crew if c.id != foreman.id],
-            key=lambda c: c.hourly_rate, reverse=True
-        )
-        return [foreman] + others
-    return sorted(crew, key=lambda c: c.hourly_rate, reverse=True)
-
 def fill_hourly_rates(crew: List[CrewMember], fallback: float = 20.60):
     for c in crew:
         if not c.hourly_rate or c.hourly_rate <= 0:
             c.hourly_rate = fallback
 
-# ─── Section Division ─────────────────────────────────────────────────────────
+def order_crew(crew: List[CrewMember]) -> List[CrewMember]:
+    foremen = [c for c in crew if c.is_foreman]
+    others  = sorted([c for c in crew if not c.is_foreman],
+                     key=lambda c: c.hourly_rate, reverse=True)
+    return foremen + others
 
-def divide_into_sections(mow_zones: List[Zone], crew_count: int) -> List[List[Zone]]:
-    if not mow_zones:
+def select_trimmers(
+    crew: List[CrewMember],
+    trim_zones: List[Zone],
+    mow_crew_count: int,
+    all_mow_zones: List[Zone],
+    mode: str
+) -> List[CrewMember]:
+    """
+    Select dedicated trimmer(s) based on trim workload vs mow workload.
+
+    Logic:
+    1. Estimate total trim time for 1 person
+    2. Estimate mow time for the mowing crew (longest section = bottleneck)
+    3. If 1 trimmer finishes before or with mowers → 1 trimmer
+    4. If trim time > mow time → 2 trimmers to prevent trim bottleneck
+    5. Never more than 2 trimmers
+    6. Always cheapest worker(s) — ties broken by first in list only
+    """
+    if not trim_zones:
         return []
-    mower_count = max(1, int(crew_count * 0.7))
+
+    # Estimate total trim time for 1 person
+    total_trim_minutes = sum(estimate_trim_minutes(z, mode) for z in trim_zones)
+
+    # Estimate mow bottleneck — divide total mow time by mower count
+    total_mow_minutes = sum(estimate_mow_minutes(z, mode) for z in all_mow_zones)
+    mow_bottleneck = total_mow_minutes / max(mower_count := max(mow_crew_count, 1), 1)
+
+    print(f"TRIM: total_trim={total_trim_minutes:.0f}min mow_bottleneck={mow_bottleneck:.0f}min")
+
+    # 1 trimmer unless trim is the bottleneck
+    needed = 1
+    if total_trim_minutes > mow_bottleneck and needed < 2:
+        needed = 2
+        print(f"TRIM: adding 2nd trimmer — trim ({total_trim_minutes:.0f}min) > mow ({mow_bottleneck:.0f}min)")
+
+    # Cap at 2, cap at crew size - 1 (always keep at least 1 mower)
+    needed = min(needed, 2, len(crew) - 1)
+    if needed <= 0:
+        return []
+
+    # Cheapest worker(s) — ties broken by first in list
+    sorted_crew = sorted(crew, key=lambda c: c.hourly_rate)
+    return sorted_crew[:needed]
+
+
+def divide_into_sections(mow_zones: List[Zone], mower_count: int) -> List[List[Zone]]:
+    if not mow_zones or mower_count <= 0:
+        return []
     num_sections = min(mower_count, len(mow_zones))
     if num_sections <= 1:
         return [mow_zones]
     sorted_zones = sorted(mow_zones, key=lambda z: z.area_sqft, reverse=True)
     sections: List[List[Zone]] = [[] for _ in range(num_sections)]
-    section_loads = [0.0] * num_sections
+    loads = [0.0] * num_sections
     for zone in sorted_zones:
-        min_idx = section_loads.index(min(section_loads))
-        sections[min_idx].append(zone)
-        section_loads[min_idx] += zone.area_sqft
+        idx = loads.index(min(loads))
+        sections[idx].append(zone)
+        loads[idx] += zone.area_sqft
     return [s for s in sections if s]
 
 # ─── Core Run ─────────────────────────────────────────────────────────────────
@@ -392,109 +368,177 @@ def run_subset(
     all_zones: List[Zone],
     mode: str
 ) -> tuple:
-    subset_load = {c.id: 0.0 for c in subset}
-    assignments = []
-    counter = 1
 
-    subset_mowers = [c for c in subset if c.primary_role in [
-        "zero_turn", "walk_behind", "riding_mower"
-    ]]
-    subset_trimmers = [c for c in subset if c.primary_role == "trimmer"]
-
-    if not subset_mowers:
-        subset_mowers = [max(subset, key=lambda c: c.hourly_rate)]
-
-    if not subset_trimmers:
-        non_foreman = [c for c in subset if not c.is_foreman and c not in subset_mowers]
-        if non_foreman:
-            subset_trimmers = [min(non_foreman, key=lambda c: c.hourly_rate)]
-            subset_mowers = [c for c in subset_mowers if c not in subset_trimmers]
-            if not subset_mowers:
-                subset_mowers = [subset[0]]
-        else:
-            subset_trimmers = subset_mowers[-1:]
+    fill_hourly_rates(subset)
 
     all_mow = sorted(large_fields + small_mow, key=lambda z: z.area_sqft, reverse=True)
-    sections = divide_into_sections(all_mow, len(subset))
+    blow_mins = estimate_blow_minutes(all_zones, mode)
+    assignments = []
+    counter = 1
+    crew_load = {c.id: 0.0 for c in subset}
 
-    if sections:
-        for section in sections:
-            for zone in section:
-                worker = min(subset_mowers, key=lambda c: subset_load.get(c.id, 0))
-                eq = worker.primary_role if worker.primary_role in CUTTING_SPEED_MPH else "walk_behind"
-                mins = estimate_mow_minutes(zone, eq, mode)
+    # Fixed setup time — added to foreman (or first crew member)
+    foreman = next((c for c in subset if c.is_foreman), subset[0])
+    crew_load[foreman.id] += JOB_SETUP_MINUTES
+
+    # ── Crew of 2: both mow, first done trims, second blows ───────────────────
+    if len(subset) == 2:
+        ordered = order_crew(subset)
+        sections = divide_into_sections(all_mow, 2)
+
+        for i, member in enumerate(ordered):
+            section = sections[i] if i < len(sections) else []
+            for j, zone in enumerate(section):
+                mins = estimate_mow_minutes(zone, mode)
+                # Add zone travel time between zones (not before the first)
+                if j > 0:
+                    mins += ZONE_TRAVEL_MINUTES
                 assignments.append(TaskAssignment(
-                    crew_member_id=worker.id,
-                    crew_member_name=worker.name,
+                    crew_member_id=member.id,
+                    crew_member_name=member.name,
                     task_order=counter,
                     zone_id=zone.id,
                     zone_label=zone.label,
                     task_type="mow",
-                    estimated_minutes=mins,
-                    role_used=eq,
+                    estimated_minutes=int(mins),
+                    role_used="mow",
                     is_role_switch=False,
                 ))
-                subset_load[worker.id] = subset_load.get(worker.id, 0) + mins
+                crew_load[member.id] += mins
                 counter += 1
 
-    for zone in sorted(trim_zones, key=lambda z: estimate_trim_minutes(z, mode), reverse=True):
-        worker = min(subset_trimmers, key=lambda c: subset_load.get(c.id, 0))
-        prev = [a for a in assignments if a.crew_member_id == worker.id]
-        is_switch = bool(prev) and prev[-1].task_type == "mow"
-        mins = estimate_trim_minutes(zone, mode)
-        if is_switch:
-            mins += TASK_SWITCH_PENALTY_MINUTES
+        # First to finish mowing → trims
+        first_done  = min(ordered, key=lambda c: crew_load.get(c.id, 0))
+        second_done = max(ordered, key=lambda c: crew_load.get(c.id, 0))
+
+        for zone in sorted(trim_zones, key=lambda z: estimate_trim_minutes(z, mode), reverse=True):
+            mins = estimate_trim_minutes(zone, mode) + TASK_SWITCH_PENALTY
+            assignments.append(TaskAssignment(
+                crew_member_id=first_done.id,
+                crew_member_name=first_done.name,
+                task_order=counter,
+                zone_id=zone.id,
+                zone_label=zone.label,
+                task_type="trim",
+                estimated_minutes=int(mins),
+                role_used="trimmer",
+                is_role_switch=True,
+            ))
+            crew_load[first_done.id] += mins
+            counter += 1
+
+        # Second to finish mowing → blows
+        blow_total = blow_mins + TASK_SWITCH_PENALTY
         assignments.append(TaskAssignment(
-            crew_member_id=worker.id,
-            crew_member_name=worker.name,
+            crew_member_id=second_done.id,
+            crew_member_name=second_done.name,
             task_order=counter,
-            zone_id=zone.id,
-            zone_label=zone.label,
-            task_type="trim",
-            estimated_minutes=mins,
-            role_used="trimmer",
-            is_role_switch=is_switch,
+            zone_id="cleanup",
+            zone_label="Final Blowout & Cleanup",
+            task_type="blow",
+            estimated_minutes=int(blow_total),
+            role_used="blower",
+            is_role_switch=True,
         ))
-        subset_load[worker.id] = subset_load.get(worker.id, 0) + mins
-        counter += 1
+        crew_load[second_done.id] += blow_total
 
-    blow_mins = estimate_blow_minutes(all_zones, mode) + TASK_SWITCH_PENALTY_MINUTES
-    blow_worker = min(subset, key=lambda c: subset_load.get(c.id, 0))
-    assignments.append(TaskAssignment(
-        crew_member_id=blow_worker.id,
-        crew_member_name=blow_worker.name,
-        task_order=counter,
-        zone_id="cleanup",
-        zone_label="Final Blowout & Cleanup",
-        task_type="blow",
-        estimated_minutes=blow_mins,
-        role_used="blower",
-        is_role_switch=True,
-    ))
-    subset_load[blow_worker.id] = subset_load.get(blow_worker.id, 0) + blow_mins
+    # ── Crew of 3+: dedicated trimmer(s), parallel streams ────────────────────
+    else:
+        # Determine trimmer count based on workload
+        trimmers = select_trimmers(
+            subset, trim_zones,
+            mow_crew_count=len(subset) - 1,  # conservative estimate
+            all_mow_zones=all_mow,
+            mode=mode
+        )
+        trimmer_ids = {c.id for c in trimmers}
+        mowers = [c for c in subset if c.id not in trimmer_ids]
 
-    job_time = max(subset_load.values()) if subset_load else 0
+        if not mowers:
+            mowers = list(subset)
+            trimmers = []
+            trimmer_ids = set()
+
+        ordered_mowers = order_crew(mowers)
+        sections = divide_into_sections(all_mow, len(ordered_mowers))
+
+        # Mowers work their sections simultaneously
+        for i, member in enumerate(ordered_mowers):
+            section = sections[i] if i < len(sections) else []
+            for j, zone in enumerate(section):
+                mins = estimate_mow_minutes(zone, mode)
+                # Zone travel time between zones
+                if j > 0:
+                    mins += ZONE_TRAVEL_MINUTES
+                assignments.append(TaskAssignment(
+                    crew_member_id=member.id,
+                    crew_member_name=member.name,
+                    task_order=counter,
+                    zone_id=zone.id,
+                    zone_label=zone.label,
+                    task_type="mow",
+                    estimated_minutes=int(mins),
+                    role_used="mow",
+                    is_role_switch=False,
+                ))
+                crew_load[member.id] += mins
+                counter += 1
+
+        # Trimmer(s) work all trim zones in parallel — never mow
+        if trimmers and trim_zones:
+            trim_sorted = sorted(trim_zones,
+                                 key=lambda z: estimate_trim_minutes(z, mode),
+                                 reverse=True)
+            trimmer_list = list(trimmers)
+            for i, zone in enumerate(trim_sorted):
+                trimmer = trimmer_list[i % len(trimmer_list)]
+                mins = estimate_trim_minutes(zone, mode)
+                assignments.append(TaskAssignment(
+                    crew_member_id=trimmer.id,
+                    crew_member_name=trimmer.name,
+                    task_order=counter,
+                    zone_id=zone.id,
+                    zone_label=zone.label,
+                    task_type="trim",
+                    estimated_minutes=int(mins),
+                    role_used="trimmer",
+                    is_role_switch=False,
+                ))
+                crew_load[trimmer.id] += mins
+                counter += 1
+
+        # Blow — whoever finishes their primary task first
+        blow_worker = min(subset, key=lambda c: crew_load.get(c.id, 0))
+        blow_total = blow_mins + TASK_SWITCH_PENALTY
+        assignments.append(TaskAssignment(
+            crew_member_id=blow_worker.id,
+            crew_member_name=blow_worker.name,
+            task_order=counter,
+            zone_id="cleanup",
+            zone_label="Final Blowout & Cleanup",
+            task_type="blow",
+            estimated_minutes=int(blow_total),
+            role_used="blower",
+            is_role_switch=True,
+        ))
+        crew_load[blow_worker.id] += blow_total
+
+    # Fixed end walkthrough — added to foreman
+    crew_load[foreman.id] += JOB_WALKTHROUGH_MINUTES
+
+    job_time = max(crew_load.values())
     wage_cost = sum(
-        subset_load.get(c.id, 0) * c.hourly_rate / 60.0
+        crew_load.get(c.id, 0) * c.hourly_rate / 60.0
         for c in subset
     )
     return assignments, job_time, wage_cost
 
-# ─── Three Scenario Functions ─────────────────────────────────────────────────
+# ─── Scenario Functions ───────────────────────────────────────────────────────
 
-def scenario_lean(
-    zones: List[Zone],
-    available_crew: List[CrewMember]
-) -> ScenarioResult:
-    """
-    Lean Crew: Always exactly 2 crew.
-    Both may mow on large sites — first finished trims/blows.
-    Time multiplier: cheapest (1.18x) — smaller crew, slower pace.
-    """
+def scenario_lean(zones: List[Zone], available_crew: List[CrewMember]) -> ScenarioResult:
     large_fields, small_mow, trim_zones, _ = classify_zones(zones)
     ordered = order_crew(available_crew)
     subset = ordered[:2]
-
     assignments, job_time, wage_cost = run_subset(
         subset, large_fields, small_mow, trim_zones, zones, "cheapest"
     )
@@ -506,45 +550,18 @@ def scenario_lean(
     )
 
 
-def scenario_optimal(
-    zones: List[Zone],
-    available_crew: List[CrewMember]
-) -> ScenarioResult:
-    """
-    Optimal Crew: Acreage-based floor + 12% improvement algorithm.
-
-    Step 1 — Calculate minimum crew floor from total mowable acreage:
-      < 1 acre   → 2 crew
-      1-3 acres  → 2 crew
-      3-8 acres  → 3 crew
-      8-20 acres → 4 crew
-      20-40 acres → 5 crew
-      > 40 acres → 6 crew
-
-    Step 2 — Start at the floor, add one crew member at a time.
-      Stop when adding one more person saves less than 12% time.
-      Cap at min(available crew, 10).
-
-    Uses balanced time multiplier (1.0x).
-    """
+def scenario_optimal(zones: List[Zone], available_crew: List[CrewMember]) -> ScenarioResult:
     large_fields, small_mow, trim_zones, _ = classify_zones(zones)
     ordered = order_crew(available_crew)
     max_crew = min(len(ordered), 10)
+    floor = min(get_optimal_crew_floor(zones), max_crew)
 
-    # Step 1 — acreage floor
-    floor = get_optimal_crew_floor(zones)
-    floor = min(floor, max_crew)
-
-    print(f"OPTIMAL floor={floor} max={max_crew}")
-
-    # Step 2 — start at floor
     best_assignments, best_time, best_cost = run_subset(
         ordered[:floor], large_fields, small_mow, trim_zones, zones, "balanced"
     )
     best_size = floor
-    print(f"OPTIMAL size={floor} time={best_time:.0f}min")
+    print(f"OPTIMAL floor={floor} time={best_time:.0f}min")
 
-    # Iterate upward from floor
     for size in range(floor + 1, max_crew + 1):
         subset = ordered[:size]
         assignments, job_time, wage_cost = run_subset(
@@ -552,7 +569,6 @@ def scenario_optimal(
         )
         improvement = (best_time - job_time) / best_time if best_time > 0 else 0
         print(f"OPTIMAL size={size} time={job_time:.0f}min improvement={improvement:.1%}")
-
         if improvement >= 0.12:
             best_size = size
             best_time = job_time
@@ -561,7 +577,6 @@ def scenario_optimal(
         else:
             break
 
-    print(f"OPTIMAL final: {best_size} crew, {best_time:.0f}min, ${best_cost:.2f}")
     return ScenarioResult(
         crew_size=best_size,
         total_minutes=int(best_time),
@@ -575,20 +590,13 @@ def scenario_max_speed(
     available_crew: List[CrewMember],
     optimal_size: int
 ) -> ScenarioResult:
-    """
-    Max Speed: Optimal crew size + 2 extra.
-    Uses fastest time multiplier (0.88x).
-    Capped at total available crew.
-    """
     large_fields, small_mow, trim_zones, _ = classify_zones(zones)
     ordered = order_crew(available_crew)
     size = min(optimal_size + 2, len(ordered))
     subset = ordered[:size]
-
     assignments, job_time, wage_cost = run_subset(
         subset, large_fields, small_mow, trim_zones, zones, "fastest"
     )
-    print(f"MAX SPEED: {size} crew, {job_time:.0f}min, ${wage_cost:.2f}")
     return ScenarioResult(
         crew_size=size,
         total_minutes=int(job_time),
@@ -601,13 +609,8 @@ def scenario_assigned(
     zones: List[Zone],
     assigned_crew: List[CrewMember]
 ) -> ScenarioResult:
-    """
-    Assigned Crew: Runs assignment for exactly the pre-assigned crew.
-    Uses balanced multiplier. Saved to job_tasks in the DB.
-    """
     large_fields, small_mow, trim_zones, _ = classify_zones(zones)
     ordered = order_crew(assigned_crew)
-
     assignments, job_time, wage_cost = run_subset(
         ordered, large_fields, small_mow, trim_zones, zones, "balanced"
     )
@@ -642,9 +645,9 @@ def optimize(request: OptimizeRequest):
     fill_hourly_rates(list(request.crew))
 
     try:
-        lean_result = scenario_lean(request.zones, all_crew)
-        optimal_result = scenario_optimal(request.zones, all_crew)
-        max_result = scenario_max_speed(request.zones, all_crew, optimal_result.crew_size)
+        lean_result     = scenario_lean(request.zones, all_crew)
+        optimal_result  = scenario_optimal(request.zones, all_crew)
+        max_result      = scenario_max_speed(request.zones, all_crew, optimal_result.crew_size)
         assigned_result = scenario_assigned(request.zones, list(request.crew))
     except Exception as e:
         import traceback
@@ -655,8 +658,8 @@ def optimize(request: OptimizeRequest):
     blow_zones = [z for z in request.zones if z.zone_type in ["perimeter", "trim"]]
     has_real_footage = any(z.linear_ft or z.perimeter_ft for z in blow_zones)
     if has_real_footage:
-        total_blow_ft = sum((z.linear_ft or z.perimeter_ft or 0) for z in blow_zones)
-        blow_note = f"Whoever finishes first blows — approx {int(total_blow_ft):,} ft of surfaces"
+        total_ft = sum((z.linear_ft or z.perimeter_ft or 0) for z in blow_zones)
+        blow_note = f"Whoever finishes first blows — approx {int(total_ft):,} ft"
     else:
         blow_note = "Whoever finishes first picks up the blower"
 
@@ -676,22 +679,18 @@ def optimize(request: OptimizeRequest):
 @app.get("/recommend-crew")
 def recommend_crew(total_sqft: float, zone_types: str = "mow,trim"):
     zones_list = zone_types.split(",")
-    has_slopes = "berm" in zones_list or "slope" in zones_list
+    has_slopes     = "berm" in zones_list or "slope" in zones_list
     has_courtyards = "courtyard" in zones_list
     has_large_trim = "perimeter" in zones_list
     acres = total_sqft / 43560.0
 
-    lean = max(MIN_CREW_SIZE, int(acres / 2))
+    lean    = max(MIN_CREW_SIZE, int(acres / 2))
     optimal = max(3, int(acres / 1.5))
-    fast = max(4, int(acres / 1.0))
+    fast    = max(4, int(acres / 1.0))
 
-    if has_slopes:
-        lean += 1
-        optimal += 1
-    if has_courtyards:
-        optimal += 1
-    if has_large_trim:
-        lean += 1
+    if has_slopes:     lean += 1; optimal += 1
+    if has_courtyards: optimal += 1
+    if has_large_trim: lean += 1
 
     return {"lean": lean, "optimal": optimal, "fast": fast, "acres": round(acres, 2)}
 
