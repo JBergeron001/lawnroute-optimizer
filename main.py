@@ -300,9 +300,24 @@ def estimate_blow_minutes(all_zones: List[Zone], mode: str = "balanced") -> int:
 
 def classify_zones(zones: List[Zone]):
     workable   = [z for z in zones if z.zone_type != "no_mow"]
-    mow_zones  = [z for z in workable if z.zone_type in [
+    no_mow     = [z for z in zones if z.zone_type == "no_mow"]
+
+    # Subtract total no-mow sqft proportionally from mow zones so the optimizer
+    # doesn't count protected areas as workable acreage.
+    total_no_mow_sqft = sum(z.area_sqft for z in no_mow)
+    mow_zones = [z for z in workable if z.zone_type in [
         "mow", "berm", "island", "courtyard", "slope"
     ]]
+
+    if total_no_mow_sqft > 0 and mow_zones:
+        total_mow_sqft = sum(z.area_sqft for z in mow_zones)
+        if total_mow_sqft > 0:
+            for z in mow_zones:
+                share  = z.area_sqft / total_mow_sqft
+                deduct = min(total_no_mow_sqft * share, z.area_sqft - 100)
+                z.area_sqft = max(z.area_sqft - deduct, 100)
+            print(f"NO-MOW: deducted {total_no_mow_sqft:.0f} sqft across {len(mow_zones)} mow zones")
+
     trim_zones = [z for z in workable if z.zone_type in ["trim", "perimeter"]]
     large_fields = [
         z for z in mow_zones
