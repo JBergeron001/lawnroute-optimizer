@@ -1,4 +1,4 @@
-"""
+﻿"""
 LawnRoute OSM Graph Builder v3
 Improved classification engine with correct handling of:
 - Golf course features (bunkers, greens, fairways, paths)
@@ -187,7 +187,14 @@ def coords_to_polygon(coords: list) -> Optional[Polygon]:
         return None
     try:
         p = Polygon(coords)
-        if p.is_valid and not p.is_empty:
+        if p.is_empty:
+            return None
+        if not p.is_valid:
+            from shapely.validation import make_valid
+            p = make_valid(p)
+            if hasattr(p, "geoms"):
+                p = max(p.geoms, key=lambda g: g.area)
+        if isinstance(p, Polygon) and not p.is_empty:
             return p
         return None
     except Exception:
@@ -659,8 +666,19 @@ def build_graph_for_property(property_id: str, triggered_by_user_id: str = None)
             if hasattr(geom, "geoms"):
                 geom = list(geom.geoms)[0]
 
+        # Repair any self-intersecting or invalid boundary geometry before use.
+        # A hand-drawn polygon with crossing lines causes TopologyException in PostGIS.
+        # make_valid() fixes this by splitting/healing the geometry automatically.
+        if not geom.is_valid:
+            from shapely.validation import make_valid
+            geom = make_valid(geom)
+            logger.warning(f"Boundary geometry was invalid — repaired with make_valid()")
+            # make_valid may return a MultiPolygon; take the largest piece
+            if hasattr(geom, "geoms"):
+                geom = max(geom.geoms, key=lambda g: g.area)
+
         boundary_polygon = geom
-        logger.info(f"Loaded boundary for '{prop['name']}'")
+        logger.info(f"Loaded boundary for '{prop['name']}' (valid={boundary_polygon.is_valid})")
 
         query_start = time.time()
         bbox_str = build_bbox_string(boundary_polygon)
