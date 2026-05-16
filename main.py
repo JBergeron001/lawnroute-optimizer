@@ -136,7 +136,7 @@ class OptimizeResponse(BaseModel):
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-MOW_SPEED_MPH   = 5.5          # raised from 4.5 — calibrated to real-world zero-turn pace
+MOW_SPEED_MPH   = 5.0          # calibrated: between raw 4.5 and overcorrected 5.5
 DECK_FT_OPEN    = 5.0          # 60 inch zero-turn
 DECK_FT_COMPLEX = 3.0          # 36 inch walk-behind
 
@@ -151,11 +151,11 @@ TASK_SWITCH_PENALTY     = 8    # tool swap time — matches UI display
 MIN_CREW_SIZE    = 2
 LARGE_FIELD_ACRES = 10.0
 
-# Raised balanced efficiency from 0.35 → 0.52 — reflects skilled operator reality
+# Calibrated: Meadowbrook 11ac, 5 crew, 6-7h real. Lean (2 crew) ~double optimal.
 BASE_EFFICIENCY = {
-    "fastest":  0.62,
-    "balanced": 0.52,
-    "cheapest": 0.42,
+    "fastest":  0.54,
+    "balanced": 0.43,
+    "cheapest": 0.35,
 }
 
 MODE_SPEED_MULTIPLIER = {
